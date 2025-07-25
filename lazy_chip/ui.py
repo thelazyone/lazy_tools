@@ -11,11 +11,11 @@ class WeatheringProps(PropertyGroup):
     noise_contrast_property: FloatProperty(name="Noise Contrast", default=1.0, min=0, max=1024)
     seed_property: IntProperty(name="Seed", default=0, min=0, max=999999)
     random_seed_property: bpy.props.BoolProperty(name="Random Seed", default=True)
-    fixed_scale_check_property: bpy.props.BoolProperty(name="Use Fixed Scale", default=False)
-    fixed_scale_property: FloatProperty(name="Noise Scale", default=1, min=0, max=20)
-    attempts_property: IntProperty(name="Attempts", default=5, min=1, max=100, description="Number of times the script attempts to apply its logic before giving up")
-    fix_between_steps_property: bpy.props.BoolProperty(name="Fix Between Steps", default=True)
-    simplify_damage_ratio_property: FloatProperty(name="Simplify Damage Ratio",default=0.5,min=0.05,max=1.0,description="Ratio for mesh decimation to simplify damage (1 = no decimation)")
+    fixed_scale_check_property: bpy.props.BoolProperty(name="Use Fixed Scale", default=True)
+    fixed_scale_property: FloatProperty(name="Noise Scale", default=4, min=0.1, max=20)
+    attempts_property: IntProperty(name="Attempts", default=1, min=1, max=5, description="Number of times the script attempts to apply its logic before giving up")
+    fix_between_steps_property: bpy.props.BoolProperty(name="Fix Between Steps", default=False)
+    simplify_damage_ratio_property: FloatProperty(name="Simplify Damage Ratio",default=0.2,min=0.05,max=1.0,description="Ratio for mesh decimation to simplify damage (1 = no decimation)")
 
 
 class WeatheringPanel(Panel):
