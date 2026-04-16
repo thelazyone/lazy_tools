@@ -9,7 +9,7 @@ from mathutils import Vector
 bl_info = {
     "name": "Smart Decimation",
     "author": "thelazyone",
-    "version": (1, 0, 4),
+    "version": (1, 0, 7),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Decimate meshes with extra checks.",
@@ -171,17 +171,22 @@ class DecimateAndFixSettings(bpy.types.PropertyGroup):
     fix_non_manifold: BoolProperty(
         name="Fix Non-Manifold",
         description="Automatically fix non-manifold issues",
-        default=True,
+        default=False,
     )
     fix_intersections: BoolProperty(
         name="Fix Intersections",
         description="Automatically fix intersecting faces",
-        default=True,
+        default=False,
     )
     remesh_before_decimation: BoolProperty(
         name="Remesh Before Decimation",
         description="Apply remeshing before decimation",
         default=False,
+    )
+    apply_scale_before_remesh: BoolProperty(
+        name="Apply Scale",
+        description="Before remesh, apply object scale if it is not 1,1,1",
+        default=True,
     )
     remesh_value: FloatProperty(
         name="Remesh Value",
@@ -190,6 +195,35 @@ class DecimateAndFixSettings(bpy.types.PropertyGroup):
         max=10.0,
         default=1.0,
     )
+
+
+def _scale_is_unit(obj, abs_tol=1e-6):
+    return all(math.isclose(obj.scale[i], 1.0, rel_tol=0.0, abs_tol=abs_tol) for i in range(3))
+
+
+def _process_decimate_object(obj, context, settings, decimate_ratio, do_remesh):
+    """Run remesh (optional), decimate at decimate_ratio, then fix_mesh. Caller sets active/select."""
+    original_select_mode = context.tool_settings.mesh_select_mode[:]
+
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    if do_remesh and settings.remesh_before_decimation:
+        if settings.apply_scale_before_remesh and not _scale_is_unit(obj):
+            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+        bpy.context.object.data.remesh_voxel_size = settings.remesh_value
+        bpy.ops.object.voxel_remesh()
+
+    bpy.ops.object.mode_set(mode="EDIT")
+    context.tool_settings.mesh_select_mode = (True, False, False)
+
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.decimate(ratio=decimate_ratio)
+
+    fix_mesh(obj, settings)
+
+    context.tool_settings.mesh_select_mode = original_select_mode
+    bpy.ops.object.mode_set(mode="OBJECT")
 
 
 # Decimating the mesh, then calling (conditionally) the fix_mesh function.
@@ -221,36 +255,10 @@ class MESH_OT_decimate_and_fix(Operator):
             bpy.context.view_layer.objects.active = obj
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
-            
-            # Save current selection mode
-            original_select_mode = context.tool_settings.mesh_select_mode[:]
-            
-            # Ensure we're in object mode to apply modifiers
-            bpy.ops.object.mode_set(mode='OBJECT')
 
-            if settings.remesh_before_decimation:
-
-                # Apply scale before any operations
-                bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
-
-                # Assuming 'remesh_value' would be used with a remesh modifier logic here
-                bpy.context.object.data.remesh_voxel_size = settings.remesh_value
-                bpy.ops.object.voxel_remesh()
-
-            # Switch to vertex select mode for operations
-            bpy.ops.object.mode_set(mode='EDIT')
-            context.tool_settings.mesh_select_mode = (True, False, False)
-
-            # Add and apply Decimate modifier
-            bpy.ops.mesh.select_all(action='SELECT')  # Select all geometry
-            bpy.ops.mesh.decimate(ratio=settings.decimate_ratio)
-            
-            # Fix non-manifold geometry if necessary
-            fix_mesh(obj, settings)
-
-            # Restore original selection mode
-            context.tool_settings.mesh_select_mode = original_select_mode
-            bpy.ops.object.mode_set(mode='OBJECT')     
+            _process_decimate_object(
+                obj, context, settings, settings.decimate_ratio, do_remesh=True
+            )
         
         # Restore the original selection
         bpy.ops.object.select_all(action='DESELECT')
@@ -265,18 +273,58 @@ class MESH_OT_decimate_and_fix(Operator):
         return {'FINISHED'}
 
 
-# Preset Ratio operator. Simply set a default value to the decimation ratio parameter.
-class MESH_OT_set_decimate_ratio(Operator):
-    """Set a preset decimate ratio"""
-    bl_idname = "mesh.set_decimate_ratio"
-    bl_label = "Set Decimate Ratio"
-    ratio: FloatProperty()
+class MESH_OT_quick_decimate(Operator):
+    """Decimate at a fixed ratio: ignores ratio UI and remesh-before-decimation."""
+
+    bl_idname = "mesh.quick_decimate"
+    bl_label = "Quick Decimate"
+    bl_description = (
+        "Decimate at the chosen ratio without remesh; UI ratio and remesh options are ignored"
+    )
+
+    ratio: FloatProperty(
+        name="Ratio",
+        description="Decimate ratio for this operation only",
+        min=0.01,
+        max=1.0,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "MESH"
 
     def execute(self, context):
-        context.scene.decimate_and_fix_settings.decimate_ratio = self.ratio
-        return {'FINISHED'}
-    
-    
+        original_selection = context.selected_objects.copy()
+        objects = context.selected_objects
+        total_objects = len(objects)
+        settings = context.scene.decimate_and_fix_settings
+
+        for index, obj in enumerate(objects, start=1):
+            if obj.type != "MESH":
+                continue
+
+            self.report(
+                {"INFO"},
+                f"Quick decimate {index}/{total_objects}: {obj.name} (ratio={self.ratio})",
+            )
+
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+
+            _process_decimate_object(obj, context, settings, self.ratio, do_remesh=False)
+
+        bpy.ops.object.select_all(action="DESELECT")
+        for o in original_selection:
+            o.select_set(True)
+
+        if original_selection:
+            bpy.context.view_layer.objects.active = original_selection[0]
+
+        self.report({"INFO"}, "Finished quick decimate")
+        return {"FINISHED"}
+
+
 # Just Fix Operator
 class MESH_OT_just_fix(Operator):
     bl_idname = "mesh.just_fix"
@@ -314,19 +362,19 @@ class MESH_PT_decimate_and_fix(Panel):
         layout = self.layout
         settings = context.scene.decimate_and_fix_settings
 
+        row = layout.row()
+        row.operator("mesh.quick_decimate", text=".5 decimation").ratio = 0.5
+        row.operator("mesh.quick_decimate", text=".1 decimation").ratio = 0.1
+
+        layout.separator(factor=0.5)
 
         # Decimation ratio and remesh settings
         layout.prop(settings, "decimate_ratio")
         layout.prop(settings, "remesh_before_decimation")
 
         if settings.remesh_before_decimation:
+            layout.prop(settings, "apply_scale_before_remesh")
             layout.prop(settings, "remesh_value")
-
-        # Preset buttons in a single row
-        row = layout.row()
-        row.operator("mesh.set_decimate_ratio", text="0.25").ratio = 0.25
-        row.operator("mesh.set_decimate_ratio", text="0.1").ratio = 0.1
-        row.operator("mesh.set_decimate_ratio", text="0.025").ratio = 0.025
 
         # Options for the Decimation
         layout.prop(settings, "fix_non_manifold")
@@ -341,16 +389,16 @@ class MESH_PT_decimate_and_fix(Panel):
 
 def register():
     bpy.utils.register_class(MESH_OT_decimate_and_fix)
+    bpy.utils.register_class(MESH_OT_quick_decimate)
     bpy.utils.register_class(MESH_PT_decimate_and_fix)
-    bpy.utils.register_class(MESH_OT_set_decimate_ratio)
     bpy.utils.register_class(MESH_OT_just_fix)
     bpy.utils.register_class(DecimateAndFixSettings)
     bpy.types.Scene.decimate_and_fix_settings = bpy.props.PointerProperty(type=DecimateAndFixSettings)
 
 def unregister():
     bpy.utils.unregister_class(MESH_OT_decimate_and_fix)
+    bpy.utils.unregister_class(MESH_OT_quick_decimate)
     bpy.utils.unregister_class(MESH_PT_decimate_and_fix)
-    bpy.utils.unregister_class(MESH_OT_set_decimate_ratio)
     bpy.utils.unregister_class(MESH_OT_just_fix)
     bpy.utils.unregister_class(DecimateAndFixSettings)
     del bpy.types.Scene.decimate_and_fix_settings
