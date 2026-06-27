@@ -32,25 +32,282 @@ class ExtendedMaterialSettings(bpy.types.PropertyGroup):
         default=6, min=1, max=6
     )
 
+def _value_fingerprint(val):
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return ("bool", val)
+    if isinstance(val, (int, float)):
+        return ("num", float(val))
+    if isinstance(val, str):
+        return ("str", val)
+    if isinstance(val, tuple):
+        return ("tuple",) + tuple(_value_fingerprint(v) for v in val)
+    return ("repr", repr(val))
+
+
+def _socket_default_value(socket):
+    if socket.is_linked:
+        return None
+    try:
+        val = socket.default_value
+    except (AttributeError, TypeError):
+        return None
+    if hasattr(val, "__len__") and not isinstance(val, str):
+        try:
+            val = tuple(val)
+        except TypeError:
+            pass
+    return _value_fingerprint(val)
+
+
+def _image_fingerprint(image):
+    if image is None:
+        return None
+    fp = ("image", image.size[0], image.size[1], image.filepath or "")
+    if image.pixels:
+        sample_len = min(len(image.pixels), 64)
+        fp = fp + (tuple(image.pixels[:sample_len]),)
+    return fp
+
+
+def _node_sort_key(node):
+    return repr(_node_fingerprint(node))
+
+
+def _node_fingerprint(node):
+    data = [node.type, node.bl_idname]
+    for inp in node.inputs:
+        val = _socket_default_value(inp)
+        if val is not None:
+            data.append((inp.identifier, val))
+    if node.type == "TEX_IMAGE":
+        data.append(("image", _image_fingerprint(node.image)))
+    return tuple(data)
+
+
+_MATERIAL_SKIP_PROPS = {
+    "name", "name_full", "users", "use_fake_user", "library", "tag",
+    "is_evaluated", "original", "override_library", "asset_data",
+    "preview", "node_tree",
+}
+
+
+def _material_props_fingerprint(mat):
+    values = []
+    for prop in mat.bl_rna.properties:
+        if prop.is_readonly or prop.identifier in _MATERIAL_SKIP_PROPS:
+            continue
+        if prop.type == "POINTER":
+            continue
+        try:
+            val = getattr(mat, prop.identifier)
+            if hasattr(val, "__len__") and not isinstance(val, str):
+                val = tuple(val)
+            val = _value_fingerprint(val)
+            values.append((prop.identifier, val))
+        except (AttributeError, TypeError):
+            pass
+    return tuple(sorted(values))
+
+
+def material_fingerprint(mat):
+    if mat is None:
+        return None
+
+    if not mat.use_nodes:
+        return ("legacy", _material_props_fingerprint(mat))
+
+    tree = mat.node_tree
+    if tree is None:
+        return ("empty_nodes", _material_props_fingerprint(mat))
+
+    nodes_sorted = sorted(tree.nodes, key=_node_sort_key)
+    node_index = {node: idx for idx, node in enumerate(nodes_sorted)}
+    node_fps = [_node_fingerprint(node) for node in nodes_sorted]
+    link_fps = sorted(
+        (
+            node_index[link.from_node],
+            link.from_socket.identifier,
+            node_index[link.to_node],
+            link.to_socket.identifier,
+        )
+        for link in tree.links
+    )
+    return ("nodes", _material_props_fingerprint(mat), tuple(node_fps), tuple(link_fps))
+
+
+def _replace_material(old_mat, new_mat):
+    if old_mat == new_mat:
+        return
+    old_mat.user_remap(new_mat)
+    bpy.data.materials.remove(old_mat, do_unlink=True)
+
+
+def _selected_mesh_objects(context):
+    return [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+
+def remove_unused_material_slots(obj):
+    mesh = obj.data
+    if not hasattr(mesh, "materials") or not hasattr(mesh, "polygons"):
+        return 0
+
+    old_count = len(mesh.materials)
+    if old_count == 0:
+        return 0
+
+    if mesh.polygons:
+        used_indices = set()
+        for poly in mesh.polygons:
+            idx = poly.material_index
+            if idx >= old_count:
+                idx = 0
+            used_indices.add(idx)
+    else:
+        used_indices = set()
+
+    if len(used_indices) == old_count:
+        return 0
+
+    used_sorted = sorted(used_indices)
+    index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(used_sorted)}
+
+    for poly in mesh.polygons:
+        old_idx = poly.material_index
+        if old_idx >= old_count:
+            old_idx = 0
+        poly.material_index = index_map.get(old_idx, 0)
+
+    new_materials = [mesh.materials[i] for i in used_sorted]
+    mesh.materials.clear()
+    for mat in new_materials:
+        mesh.materials.append(mat)
+
+    if mesh.materials:
+        if obj.active_material_index in index_map:
+            obj.active_material_index = index_map[obj.active_material_index]
+        else:
+            obj.active_material_index = min(obj.active_material_index, len(mesh.materials) - 1)
+    else:
+        obj.active_material_index = 0
+
+    return old_count - len(new_materials)
+
+
+class MATERIAL_OT_remove_unused_materials(Operator):
+    bl_idname = "material.remove_unused"
+    bl_label = "Remove Unused Materials"
+    bl_description = "Remove materials in the file that are not used by any object"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        removed = 0
+        for mat in list(bpy.data.materials):
+            if mat.users == 0 and not mat.use_fake_user:
+                bpy.data.materials.remove(mat, do_unlink=True)
+                removed += 1
+
+        if removed:
+            self.report({"INFO"}, f"Removed {removed} unused material(s)")
+        else:
+            self.report({"INFO"}, "No unused materials found")
+        return {"FINISHED"}
+
+
+class MATERIAL_OT_merge_duplicate_materials(Operator):
+    bl_idname = "material.merge_duplicates"
+    bl_label = "Merge Duplicate Materials"
+    bl_description = (
+        "Find materials with identical settings and node trees, "
+        "keep the alphabetically first name, and reassign all users"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        groups = {}
+        for mat in bpy.data.materials:
+            groups.setdefault(material_fingerprint(mat), []).append(mat)
+
+        merged = 0
+        for fingerprint, materials in groups.items():
+            if len(materials) < 2:
+                continue
+
+            keeper = min(materials, key=lambda m: m.name.lower())
+            for mat in materials:
+                if mat == keeper:
+                    continue
+                _replace_material(mat, keeper)
+                merged += 1
+
+        if merged:
+            self.report({"INFO"}, f"Merged {merged} duplicate material(s)")
+        else:
+            self.report({"INFO"}, "No duplicate materials found")
+        return {"FINISHED"}
+
+
 class MATERIAL_OT_delete_materials(Operator):
     bl_idname = "material.delete_materials"
-    bl_label = "Delete Materials"
-    bl_description = "Deletes all materials from selected objects"
+    bl_label = "Remove Materials"
+    bl_description = "Remove all material slots from selected mesh objects"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and \
-            context.object.type == 'MESH' and  \
-            len(context.selected_objects) == 1 and \
-            context.mode == 'OBJECT'
-        
+        return context.mode == 'OBJECT' and bool(_selected_mesh_objects(context))
+
     def execute(self, context):
-        selected_objects = context.selected_objects
-        for obj in selected_objects:
-            if obj.type == 'MESH':
-                obj.data.materials.clear()                
-        self.report({'INFO'}, "Deleted materials from selected objects")
+        count = 0
+        for obj in _selected_mesh_objects(context):
+            obj.data.materials.clear()
+            obj.active_material_index = 0
+            count += 1
+
+        if count == 1:
+            self.report({'INFO'}, "Removed materials from selected object")
+        else:
+            self.report({'INFO'}, f"Removed materials from {count} selected objects")
+        return {'FINISHED'}
+
+
+class MATERIAL_OT_remove_unused_from_selected(Operator):
+    bl_idname = "material.remove_unused_from_selected"
+    bl_label = "Remove Unused From Selected"
+    bl_description = (
+        "Remove material slots from selected objects that are not used by any face"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and bool(_selected_mesh_objects(context))
+
+    def execute(self, context):
+        objects = _selected_mesh_objects(context)
+        removed_slots = 0
+        changed_objects = 0
+
+        for obj in objects:
+            removed = remove_unused_material_slots(obj)
+            if removed:
+                removed_slots += removed
+                changed_objects += 1
+
+        if removed_slots:
+            if changed_objects == 1:
+                self.report(
+                    {'INFO'},
+                    f"Removed {removed_slots} unused material slot(s) from selected object",
+                )
+            else:
+                self.report(
+                    {'INFO'},
+                    f"Removed {removed_slots} unused material slot(s) from {changed_objects} objects",
+                )
+        else:
+            self.report({'INFO'}, "No unused material slots found on selected objects")
         return {'FINISHED'}
     
 class MATERIAL_OT_generate_materials(Operator):
@@ -654,8 +911,16 @@ class MATERIAL_PT_custom_panel(Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.extended_material_settings
+        obj = context.active_object
+        mesh = obj.data if obj and obj.type == 'MESH' else None
 
         layout.operator(MATERIAL_OT_delete_materials.bl_idname)
+        layout.operator(MATERIAL_OT_remove_unused_from_selected.bl_idname)
+
+        layout.separator()
+        layout.label(text="Scene Cleanup")
+        layout.operator(MATERIAL_OT_merge_duplicate_materials.bl_idname)
+        layout.operator(MATERIAL_OT_remove_unused_materials.bl_idname)
 
         layout.separator()
         layout.label(text="UV Mapping")
@@ -664,7 +929,7 @@ class MATERIAL_PT_custom_panel(Panel):
         layout.separator()
         layout.label(text="Color Palette")
         col = layout.column()
-        col.enabled = "uv_color" in context.active_object.data.uv_layers.keys() and context.mode == 'OBJECT'
+        col.enabled = mesh is not None and "uv_color" in mesh.uv_layers.keys() and context.mode == 'OBJECT'
         row = col.row()
         row.prop(settings, "palette_rows", text="Rows")
         row.prop(settings, "palette_columns", text="Columns")
@@ -675,8 +940,7 @@ class MATERIAL_PT_custom_panel(Panel):
         layout.separator()
         layout.label(text="Set Face Color")
         col = layout.column()
-        col.enabled = context.mode == 'EDIT_MESH' and context.active_object.data.total_face_sel > 0
-        obj = context.active_object
+        col.enabled = context.mode == 'EDIT_MESH' and mesh is not None and mesh.total_face_sel > 0
         if obj:
             colors = get_palette_colors(obj, settings.palette_columns, settings.palette_rows)
             for row_index, row_colors in enumerate(colors):
@@ -693,7 +957,7 @@ class MATERIAL_PT_custom_panel(Panel):
         layout.separator()
         layout.label(text="AO Baking")
         col = layout.column()
-        col.enabled = "uv_ao" in context.active_object.data.uv_layers.keys() and context.mode == 'OBJECT'
+        col.enabled = mesh is not None and "uv_ao" in mesh.uv_layers.keys() and context.mode == 'OBJECT'
         col.operator(MATERIAL_OT_bake_ao.bl_idname)
 
         layout.separator()
@@ -709,6 +973,9 @@ def register():
     bpy.utils.register_class(ExtendedMaterialSettings)
     bpy.types.Scene.extended_material_settings = bpy.props.PointerProperty(type=ExtendedMaterialSettings)
 
+    bpy.utils.register_class(MATERIAL_OT_remove_unused_materials)
+    bpy.utils.register_class(MATERIAL_OT_merge_duplicate_materials)
+    bpy.utils.register_class(MATERIAL_OT_remove_unused_from_selected)
     bpy.utils.register_class(MATERIAL_OT_delete_materials)
     bpy.utils.register_class(MATERIAL_OT_generate_materials)
     bpy.utils.register_class(MATERIAL_OT_bake_ao)
@@ -725,6 +992,9 @@ def unregister():
     bpy.utils.unregister_class(ExtendedMaterialSettings)
     del bpy.types.Scene.extended_material_settings
 
+    bpy.utils.unregister_class(MATERIAL_OT_remove_unused_materials)
+    bpy.utils.unregister_class(MATERIAL_OT_merge_duplicate_materials)
+    bpy.utils.unregister_class(MATERIAL_OT_remove_unused_from_selected)
     bpy.utils.unregister_class(MATERIAL_OT_delete_materials)
     bpy.utils.unregister_class(MATERIAL_OT_generate_materials)
     bpy.utils.unregister_class(MATERIAL_OT_bake_ao)
