@@ -1,5 +1,5 @@
 bl_info = {
-    "name": "Extended Materials and UV Tools",
+    "name": "Lazy Materials",
     "author": "thelazyone",
     "version": (1, 0),
     "blender": (4, 0, 0),
@@ -148,6 +148,63 @@ def _selected_mesh_objects(context):
     return [obj for obj in context.selected_objects if obj.type == 'MESH']
 
 
+def _object_has_no_material(obj):
+    materials = obj.data.materials
+    return len(materials) == 0 or not any(mat is not None for mat in materials)
+
+
+def _material_matching_name(name):
+    exact = bpy.data.materials.get(name)
+    if exact:
+        return exact
+
+    name_lower = name.lower()
+    matches = [mat for mat in bpy.data.materials if mat.name.lower() == name_lower]
+    if not matches:
+        return None
+    for mat in matches:
+        if mat.name == name:
+            return mat
+    return matches[0]
+
+
+def _collection_matching_name(name):
+    exact = bpy.data.collections.get(name)
+    if exact:
+        return exact
+
+    name_lower = name.lower()
+    matches = [coll for coll in bpy.data.collections if coll.name.lower() == name_lower]
+    if not matches:
+        return None
+    for coll in matches:
+        if coll.name == name:
+            return coll
+    return matches[0]
+
+
+def _get_or_create_collection(context, name):
+    coll = _collection_matching_name(name)
+    if coll:
+        return coll
+    coll = bpy.data.collections.new(name)
+    context.scene.collection.children.link(coll)
+    return coll
+
+
+def _object_primary_material(obj):
+    materials = obj.data.materials
+    if not materials:
+        return None
+    idx = obj.active_material_index
+    if 0 <= idx < len(materials) and materials[idx] is not None:
+        return materials[idx]
+    for mat in materials:
+        if mat is not None:
+            return mat
+    return None
+
+
 def remove_unused_material_slots(obj):
     mesh = obj.data
     if not hasattr(mesh, "materials") or not hasattr(mesh, "polygons"):
@@ -269,6 +326,95 @@ class MATERIAL_OT_delete_materials(Operator):
             self.report({'INFO'}, "Removed materials from selected object")
         else:
             self.report({'INFO'}, f"Removed materials from {count} selected objects")
+        return {'FINISHED'}
+
+
+class MATERIAL_OT_assign_from_collection(Operator):
+    bl_idname = "material.assign_from_collection"
+    bl_label = "Material as Collection"
+    bl_description = (
+        "For selected objects with no material, assign a material whose name "
+        "matches one of the object's collection names (case insensitive)"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and bool(_selected_mesh_objects(context))
+
+    def execute(self, context):
+        assigned = 0
+        skipped_has_material = 0
+        skipped_no_match = 0
+
+        for obj in _selected_mesh_objects(context):
+            if not _object_has_no_material(obj):
+                skipped_has_material += 1
+                continue
+
+            material = None
+            for collection in obj.users_collection:
+                material = _material_matching_name(collection.name)
+                if material:
+                    break
+
+            if material is None:
+                skipped_no_match += 1
+                continue
+
+            obj.data.materials.append(material)
+            obj.active_material_index = 0
+            assigned += 1
+
+        if assigned:
+            self.report({'INFO'}, f"Assigned material from collection name on {assigned} object(s)")
+        elif skipped_has_material and not skipped_no_match:
+            self.report({'INFO'}, "Selected objects already have materials")
+        else:
+            self.report({'INFO'}, "No matching collection/material names found")
+        return {'FINISHED'}
+
+
+class MATERIAL_OT_move_to_collection_from_material(Operator):
+    bl_idname = "material.move_to_collection_from_material"
+    bl_label = "Collection from Material"
+    bl_description = (
+        "For selected objects, move each object into a collection whose name "
+        "matches the object's material name"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and bool(_selected_mesh_objects(context))
+
+    def execute(self, context):
+        moved = 0
+        skipped_no_material = 0
+
+        for obj in _selected_mesh_objects(context):
+            material = _object_primary_material(obj)
+            if material is None:
+                skipped_no_material += 1
+                continue
+
+            target = _get_or_create_collection(context, material.name)
+            current_collections = list(obj.users_collection)
+
+            if current_collections == [target]:
+                continue
+
+            for coll in current_collections:
+                coll.objects.unlink(obj)
+            target.objects.link(obj)
+            moved += 1
+
+        if moved:
+            self.report({'INFO'}, f"Moved {moved} object(s) to material-named collection(s)")
+        elif skipped_no_material:
+            self.report({'INFO'}, "Selected objects have no material to match")
+        else:
+            self.report({'INFO'}, "Objects already in matching collection(s)")
         return {'FINISHED'}
 
 
@@ -900,7 +1046,7 @@ def get_palette_colors(obj, num_columns, num_rows):
 
 
 class MATERIAL_PT_custom_panel(Panel):
-    bl_label = "Extended Material Tools"
+    bl_label = "Lazy Materials"
     bl_idname = "MATERIAL_PT_custom_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -915,6 +1061,8 @@ class MATERIAL_PT_custom_panel(Panel):
         mesh = obj.data if obj and obj.type == 'MESH' else None
 
         layout.operator(MATERIAL_OT_delete_materials.bl_idname)
+        layout.operator(MATERIAL_OT_assign_from_collection.bl_idname)
+        layout.operator(MATERIAL_OT_move_to_collection_from_material.bl_idname)
         layout.operator(MATERIAL_OT_remove_unused_from_selected.bl_idname)
 
         layout.separator()
@@ -977,6 +1125,8 @@ def register():
     bpy.utils.register_class(MATERIAL_OT_merge_duplicate_materials)
     bpy.utils.register_class(MATERIAL_OT_remove_unused_from_selected)
     bpy.utils.register_class(MATERIAL_OT_delete_materials)
+    bpy.utils.register_class(MATERIAL_OT_assign_from_collection)
+    bpy.utils.register_class(MATERIAL_OT_move_to_collection_from_material)
     bpy.utils.register_class(MATERIAL_OT_generate_materials)
     bpy.utils.register_class(MATERIAL_OT_bake_ao)
     bpy.utils.register_class(MATERIAL_OT_create_palette)
@@ -996,6 +1146,8 @@ def unregister():
     bpy.utils.unregister_class(MATERIAL_OT_merge_duplicate_materials)
     bpy.utils.unregister_class(MATERIAL_OT_remove_unused_from_selected)
     bpy.utils.unregister_class(MATERIAL_OT_delete_materials)
+    bpy.utils.unregister_class(MATERIAL_OT_assign_from_collection)
+    bpy.utils.unregister_class(MATERIAL_OT_move_to_collection_from_material)
     bpy.utils.unregister_class(MATERIAL_OT_generate_materials)
     bpy.utils.unregister_class(MATERIAL_OT_bake_ao)
     bpy.utils.unregister_class(MATERIAL_OT_create_palette)
