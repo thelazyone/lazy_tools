@@ -57,6 +57,7 @@ GRUNGE_COORD_ROTATION_SCATTER = (
 )
 GRUNGE_NOISE_THRESHOLD = 0.5
 GRUNGE_BLUR_RADIUS_SCALE = 0.12
+OBJ_RANDOM_SEED_SCALE = 997.0
 
 
 # ----------------------------------------------------------------------------
@@ -324,13 +325,37 @@ def _build_blurred_scatter_fac(tree, coords, seed_socket, scale, blur, x, y):
 
 
 def _build_object_seed_modifier(tree, panel_seed_socket, obj_info, x, y):
-    """Per-object deterministic W seed: panel_seed × object index."""
+    """Per-object W seed: panel_seed × (Random×scale + Object Index + 1).
+
+    Random comes from Object Info and is unique per object. The panel seed
+    multiplies the whole field so changing Grunge Seed reshuffles every object."""
+    random_scale = tree.nodes.new('ShaderNodeMath')
+    random_scale.name = "lzla_obj_random_scale"
+    random_scale.operation = 'MULTIPLY'
+    random_scale.location = (x - 280, y - 80)
+    random_scale.inputs[1].default_value = OBJ_RANDOM_SEED_SCALE
+    tree.links.new(obj_info.outputs["Random"], random_scale.inputs[0])
+
+    obj_id_base = tree.nodes.new('ShaderNodeMath')
+    obj_id_base.name = "lzla_obj_id_base"
+    obj_id_base.operation = 'ADD'
+    obj_id_base.location = (x - 280, y)
+    obj_id_base.inputs[1].default_value = 1.0
+    tree.links.new(random_scale.outputs[0], obj_id_base.inputs[0])
+
+    obj_factor = tree.nodes.new('ShaderNodeMath')
+    obj_factor.name = "lzla_obj_factor"
+    obj_factor.operation = 'ADD'
+    obj_factor.location = (x - 120, y)
+    tree.links.new(obj_id_base.outputs[0], obj_factor.inputs[0])
+    tree.links.new(obj_info.outputs["Object Index"], obj_factor.inputs[1])
+
     obj_seed = tree.nodes.new('ShaderNodeMath')
     obj_seed.name = "lzla_obj_seed"
     obj_seed.operation = 'MULTIPLY'
     obj_seed.location = (x, y)
     tree.links.new(panel_seed_socket, obj_seed.inputs[0])
-    tree.links.new(obj_info.outputs["Object Index"], obj_seed.inputs[1])
+    tree.links.new(obj_factor.outputs[0], obj_seed.inputs[1])
     return obj_seed.outputs[0]
 
 
@@ -340,7 +365,8 @@ def _build_grunge_mask(props):
     Patch and rugged are summed and hard-stepped; scatter is a separate
     harmonic, hard-stepped on its own, then unioned in. Coordinates are
     tilted off mesh axes and all noise runs without distortion to avoid
-    linear banding. The panel seed is multiplied by each object's index."""
+    linear banding. Each object gets panel_seed × (Object Info Random + Pass Index)
+    so the global seed reshuffles all objects while keeping them distinct."""
     mat = _ensure_material(MAT_GRUNGE_MASK)
     tree = mat.node_tree
     tree.nodes.clear()
@@ -1336,49 +1362,49 @@ class LazyLineartProps(PropertyGroup):
         update=_on_setting_changed,
     )
     grunge_threshold: FloatProperty(
-        name="Grunge Threshold", default=0.67, min=0.0, max=10.0,
+        name="Grunge Threshold", default=0.52, min=0.0, max=10.0,
         description="Hard-step on the patch + rugged sum - lower covers more area",
         update=_on_setting_changed,
     )
     grunge_seed: FloatProperty(
         name="Grunge Seed", default=1.0,
-        description="Base seed multiplied per object by its Object Index "
-                    "(Object Properties → Relations → Pass Index)",
+        description="Global multiplier on each object's noise seed "
+                    "(Random-based id + optional Pass Index)",
         update=_on_setting_changed,
     )
     grunge_patch_scale: FloatProperty(
-        name="Grunge Patch Scale", default=0.7, min=0.0,
+        name="Grunge Patch Scale", default=1.0, min=0.0,
         description="Feature scale of the coarse patch noise",
         update=_on_setting_changed,
     )
     grunge_patch_amplitude: FloatProperty(
-        name="Grunge Patch Amplitude", default=1.0, min=0.0, max=10.0,
+        name="Grunge Patch Amplitude", default=0.7, min=0.0, max=10.0,
         description="Weight of the patch noise in the summed field",
         update=_on_setting_changed,
     )
     grunge_rugged_scale: FloatProperty(
-        name="Grunge Rugged Scale", default=4.2, min=0.0,
+        name="Grunge Rugged Scale", default=15.0, min=0.0,
         description="Feature scale of the fine rugged noise",
         update=_on_setting_changed,
     )
     grunge_rugged_amplitude: FloatProperty(
-        name="Grunge Rugged Amplitude", default=0.3, min=0.0, max=10.0,
+        name="Grunge Rugged Amplitude", default=0.18, min=0.0, max=10.0,
         description="Weight of the rugged noise in the summed field",
         update=_on_setting_changed,
     )
     grunge_noise_scale: FloatProperty(
-        name="Grunge Noise Scale", default=6.0, min=0.0,
+        name="Grunge Noise Scale", default=10.0, min=0.0,
         description="Scale of the scatter harmonic (higher than patch = smaller, more "
                     "isolated islands between clusters)",
         update=_on_setting_changed,
     )
     grunge_noise_intensity: FloatProperty(
-        name="Grunge Noise Intensity", default=0.45, min=0.0, max=10.0,
+        name="Grunge Noise Intensity", default=0.79, min=0.0, max=10.0,
         description="Weight of the scatter harmonic before its hard-step at 0.5",
         update=_on_setting_changed,
     )
     grunge_noise_blur: FloatProperty(
-        name="Grunge Noise Blur", default=0.08, min=0.0, max=0.5,
+        name="Grunge Noise Blur", default=0.16, min=0.0, max=0.5,
         description="Box-blur radius applied to the scatter noise field before "
                     "the hard threshold at 0.5",
         update=_on_setting_changed,
