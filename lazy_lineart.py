@@ -57,11 +57,6 @@ GRUNGE_COORD_ROTATION_SCATTER = (
 )
 GRUNGE_NOISE_THRESHOLD = 0.5
 GRUNGE_BLUR_RADIUS_SCALE = 0.12
-OBJ_HASH_X = 12.9898
-OBJ_HASH_Y = 78.233
-OBJ_HASH_Z = 45.164
-OBJ_HASH_SINE_SCALE = 43758.5453
-OBJ_HASH_WEIGHT = 997.0
 
 
 # ----------------------------------------------------------------------------
@@ -329,80 +324,13 @@ def _build_blurred_scatter_fac(tree, coords, seed_socket, scale, blur, x, y):
 
 
 def _build_object_seed_modifier(tree, panel_seed_socket, obj_info, x, y):
-    """Per-object deterministic W seed: panel_seed × (object index + position hash).
-
-    Object Index is used when set, but many scenes leave it at 0 for every
-    mesh. The origin-position hash guarantees distinct seeds regardless."""
-    loc_split = tree.nodes.new('ShaderNodeSeparateXYZ')
-    loc_split.location = (x, y - 120)
-
-    hash_x = tree.nodes.new('ShaderNodeMath')
-    hash_x.operation = 'MULTIPLY'
-    hash_x.location = (x + 150, y - 220)
-    hash_x.inputs[1].default_value = OBJ_HASH_X
-
-    hash_y = tree.nodes.new('ShaderNodeMath')
-    hash_y.operation = 'MULTIPLY'
-    hash_y.location = (x + 150, y - 320)
-    hash_y.inputs[1].default_value = OBJ_HASH_Y
-
-    hash_z = tree.nodes.new('ShaderNodeMath')
-    hash_z.operation = 'MULTIPLY'
-    hash_z.location = (x + 150, y - 420)
-    hash_z.inputs[1].default_value = OBJ_HASH_Z
-
-    hash_sum = tree.nodes.new('ShaderNodeMath')
-    hash_sum.operation = 'ADD'
-    hash_sum.location = (x + 300, y - 270)
-
-    hash_sin = tree.nodes.new('ShaderNodeMath')
-    hash_sin.operation = 'SINE'
-    hash_sin.location = (x + 450, y - 270)
-
-    hash_scale = tree.nodes.new('ShaderNodeMath')
-    hash_scale.operation = 'MULTIPLY'
-    hash_scale.location = (x + 600, y - 270)
-    hash_scale.inputs[1].default_value = OBJ_HASH_SINE_SCALE
-
-    hash_fract = tree.nodes.new('ShaderNodeMath')
-    hash_fract.operation = 'FRACT'
-    hash_fract.location = (x + 750, y - 270)
-
-    hash_weighted = tree.nodes.new('ShaderNodeMath')
-    hash_weighted.operation = 'MULTIPLY'
-    hash_weighted.location = (x + 900, y - 270)
-    hash_weighted.inputs[1].default_value = OBJ_HASH_WEIGHT
-
-    obj_id = tree.nodes.new('ShaderNodeMath')
-    obj_id.name = "lzla_obj_id"
-    obj_id.operation = 'ADD'
-    obj_id.location = (x + 300, y - 80)
-
+    """Per-object deterministic W seed: panel_seed × object index."""
     obj_seed = tree.nodes.new('ShaderNodeMath')
     obj_seed.name = "lzla_obj_seed"
     obj_seed.operation = 'MULTIPLY'
-    obj_seed.location = (x + 500, y)
+    obj_seed.location = (x, y)
     tree.links.new(panel_seed_socket, obj_seed.inputs[0])
-
-    tree.links.new(obj_info.outputs["Location"], loc_split.inputs[0])
-    tree.links.new(loc_split.outputs["X"], hash_x.inputs[0])
-    tree.links.new(loc_split.outputs["Y"], hash_y.inputs[0])
-    tree.links.new(loc_split.outputs["Z"], hash_z.inputs[0])
-    tree.links.new(hash_x.outputs[0], hash_sum.inputs[0])
-    tree.links.new(hash_y.outputs[0], hash_sum.inputs[1])
-    hash_sum_z = tree.nodes.new('ShaderNodeMath')
-    hash_sum_z.operation = 'ADD'
-    hash_sum_z.location = (x + 300, y - 370)
-    tree.links.new(hash_sum.outputs[0], hash_sum_z.inputs[0])
-    tree.links.new(hash_z.outputs[0], hash_sum_z.inputs[1])
-    tree.links.new(hash_sum_z.outputs[0], hash_sin.inputs[0])
-    tree.links.new(hash_sin.outputs[0], hash_scale.inputs[0])
-    tree.links.new(hash_scale.outputs[0], hash_fract.inputs[0])
-    tree.links.new(hash_fract.outputs[0], hash_weighted.inputs[0])
-    tree.links.new(obj_info.outputs["Object Index"], obj_id.inputs[0])
-    tree.links.new(hash_weighted.outputs[0], obj_id.inputs[1])
-    tree.links.new(obj_id.outputs[0], obj_seed.inputs[1])
-
+    tree.links.new(obj_info.outputs["Object Index"], obj_seed.inputs[1])
     return obj_seed.outputs[0]
 
 
@@ -412,8 +340,7 @@ def _build_grunge_mask(props):
     Patch and rugged are summed and hard-stepped; scatter is a separate
     harmonic, hard-stepped on its own, then unioned in. Coordinates are
     tilted off mesh axes and all noise runs without distortion to avoid
-    linear banding. The panel seed is multiplied by each object's index
-    plus an origin-position hash."""
+    linear banding. The panel seed is multiplied by each object's index."""
     mat = _ensure_material(MAT_GRUNGE_MASK)
     tree = mat.node_tree
     tree.nodes.clear()
@@ -1415,8 +1342,8 @@ class LazyLineartProps(PropertyGroup):
     )
     grunge_seed: FloatProperty(
         name="Grunge Seed", default=1.0,
-        description="Base seed multiplied per object by (Object Index + origin "
-                    "position hash) - use non-zero values for visible variation",
+        description="Base seed multiplied per object by its Object Index "
+                    "(Object Properties → Relations → Pass Index)",
         update=_on_setting_changed,
     )
     grunge_patch_scale: FloatProperty(
