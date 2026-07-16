@@ -46,6 +46,22 @@ LINEART_MOD_NAME = f"{TAG} Line Art"
 FILTER_MOD_NAME = f"{TAG} Stroke Filter"
 UTILITY_LAYER_SAMPLES = 16
 RUGGED_SEED_OFFSET = 17.3
+DOT_SEED_OFFSET = 42.0
+GRUNGE_NOISE_DETAIL = 4.0
+GRUNGE_NOISE_ROUGHNESS = 0.6
+GRUNGE_COORD_ROTATION_MAIN = (
+    math.radians(37.3), math.radians(23.7), math.radians(51.1),
+)
+GRUNGE_COORD_ROTATION_SCATTER = (
+    math.radians(19.1), math.radians(41.5), math.radians(67.8),
+)
+GRUNGE_NOISE_THRESHOLD = 0.5
+GRUNGE_BLUR_RADIUS_SCALE = 0.12
+OBJ_HASH_X = 12.9898
+OBJ_HASH_Y = 78.233
+OBJ_HASH_Z = 45.164
+OBJ_HASH_SINE_SCALE = 43758.5453
+OBJ_HASH_WEIGHT = 997.0
 
 
 # ----------------------------------------------------------------------------
@@ -191,82 +207,327 @@ def _build_override_white(props):
     return mat
 
 
+def _tilted_object_coords(tree, obj_socket, rotation, x, y, name):
+    """Tilt object-space coordinates off the mesh axes to avoid linear banding."""
+    mapping = tree.nodes.new('ShaderNodeMapping')
+    mapping.name = name
+    mapping.location = (x, y)
+    mapping.inputs['Rotation'].default_value = rotation
+    tree.links.new(obj_socket, mapping.inputs['Vector'])
+    return mapping.outputs['Vector']
+
+
+def _configure_base_noise(node, scale, detail, roughness):
+    """4D noise without distortion - distortion causes streaky linear artifacts."""
+    node.noise_dimensions = '4D'
+    _set_node_input(node, "Scale", scale)
+    _set_node_input(node, "Detail", detail)
+    _set_node_input(node, "Roughness", roughness)
+    _set_node_input(node, "Distortion", 0.0)
+
+
+def _configure_main_grunge_noise(node, scale):
+    """Patch/rugged harmonics: 4D noise with scale only, like the committed build.
+
+    Blender's default detail/roughness keeps the summed field smooth enough for
+    clean hard-step regions. Forcing high rugged detail made edges speckly."""
+    node.noise_dimensions = '4D'
+    _set_node_input(node, "Scale", scale)
+
+
+def _configure_grunge_noise(node, scale):
+    """Scatter harmonic: medium detail, no distortion."""
+    _configure_base_noise(node, scale, GRUNGE_NOISE_DETAIL, GRUNGE_NOISE_ROUGHNESS)
+
+
+def _apply_scatter_ramp(ramp):
+    """Hard-step scatter at a fixed 0.5 threshold."""
+    ramp.color_ramp.interpolation = 'CONSTANT'
+    ramp.color_ramp.elements[0].position = 0.0
+    ramp.color_ramp.elements[0].color = (1.0, 1.0, 1.0, 1.0)
+    ramp.color_ramp.elements[1].position = GRUNGE_NOISE_THRESHOLD
+    ramp.color_ramp.elements[1].color = (0.0, 0.0, 0.0, 1.0)
+
+
+def _scatter_noise_tap(tree, coords, seed_socket, scale, suffix, x, y):
+    noise = tree.nodes.new('ShaderNodeTexNoise')
+    noise.name = f"lzla_grunge_noise{suffix}"
+    noise.location = (x, y)
+    _configure_grunge_noise(noise, scale)
+    tree.links.new(coords, noise.inputs["Vector"])
+    tree.links.new(seed_socket, noise.inputs["W"])
+    return noise.outputs["Fac"]
+
+
+def _build_blurred_scatter_fac(tree, coords, seed_socket, scale, blur, x, y):
+    """Box-blur the scatter noise field before thresholding."""
+    blur_r = tree.nodes.new('ShaderNodeValue')
+    blur_r.name = "lzla_grunge_noise_blur_r"
+    blur_r.label = "Scatter Blur"
+    blur_r.location = (x - 200, y - 120)
+    blur_r.outputs[0].default_value = blur * GRUNGE_BLUR_RADIUS_SCALE
+
+    neg_r = tree.nodes.new('ShaderNodeMath')
+    neg_r.operation = 'MULTIPLY'
+    neg_r.location = (x - 50, y - 120)
+    neg_r.inputs[1].default_value = -1.0
+    tree.links.new(blur_r.outputs[0], neg_r.inputs[0])
+
+    taps = []
+    tap_specs = (
+        (0.0, 0.0, 0.0, ""),
+        (1.0, 0.0, 0.0, "_px"),
+        (-1.0, 0.0, 0.0, "_nx"),
+        (0.0, 1.0, 0.0, "_py"),
+        (0.0, -1.0, 0.0, "_ny"),
+    )
+    for ox, oy, oz, suffix in tap_specs:
+        if ox == oy == oz == 0.0:
+            sample_coords = coords
+        else:
+            offset = tree.nodes.new('ShaderNodeCombineXYZ')
+            offset.location = (x - 180, y - 180 - 40 * len(taps))
+            if ox > 0:
+                tree.links.new(blur_r.outputs[0], offset.inputs["X"])
+            elif ox < 0:
+                tree.links.new(neg_r.outputs[0], offset.inputs["X"])
+            else:
+                offset.inputs["X"].default_value = 0.0
+            if oy > 0:
+                tree.links.new(blur_r.outputs[0], offset.inputs["Y"])
+            elif oy < 0:
+                tree.links.new(neg_r.outputs[0], offset.inputs["Y"])
+            else:
+                offset.inputs["Y"].default_value = 0.0
+            offset.inputs["Z"].default_value = 0.0
+            add = tree.nodes.new('ShaderNodeVectorMath')
+            add.operation = 'ADD'
+            add.location = (x - 20, y - 180 - 40 * len(taps))
+            tree.links.new(coords, add.inputs[0])
+            tree.links.new(offset.outputs["Vector"], add.inputs[1])
+            sample_coords = add.outputs["Vector"]
+        taps.append(_scatter_noise_tap(
+            tree, sample_coords, seed_socket, scale, suffix, x + 40 * len(taps), y,
+        ))
+
+    total = taps[0]
+    for fac in taps[1:]:
+        add = tree.nodes.new('ShaderNodeMath')
+        add.operation = 'ADD'
+        add.location = (x + 220, y - 40 * len(taps))
+        tree.links.new(total, add.inputs[0])
+        tree.links.new(fac, add.inputs[1])
+        total = add.outputs[0]
+
+    avg = tree.nodes.new('ShaderNodeMath')
+    avg.name = "lzla_grunge_noise_blur_avg"
+    avg.operation = 'MULTIPLY'
+    avg.location = (x + 360, y)
+    avg.inputs[1].default_value = 1.0 / len(taps)
+    tree.links.new(total, avg.inputs[0])
+    return avg.outputs[0]
+
+
+def _build_object_seed_modifier(tree, panel_seed_socket, obj_info, x, y):
+    """Per-object deterministic W seed: panel_seed × (object index + position hash).
+
+    Object Index is used when set, but many scenes leave it at 0 for every
+    mesh. The origin-position hash guarantees distinct seeds regardless."""
+    loc_split = tree.nodes.new('ShaderNodeSeparateXYZ')
+    loc_split.location = (x, y - 120)
+
+    hash_x = tree.nodes.new('ShaderNodeMath')
+    hash_x.operation = 'MULTIPLY'
+    hash_x.location = (x + 150, y - 220)
+    hash_x.inputs[1].default_value = OBJ_HASH_X
+
+    hash_y = tree.nodes.new('ShaderNodeMath')
+    hash_y.operation = 'MULTIPLY'
+    hash_y.location = (x + 150, y - 320)
+    hash_y.inputs[1].default_value = OBJ_HASH_Y
+
+    hash_z = tree.nodes.new('ShaderNodeMath')
+    hash_z.operation = 'MULTIPLY'
+    hash_z.location = (x + 150, y - 420)
+    hash_z.inputs[1].default_value = OBJ_HASH_Z
+
+    hash_sum = tree.nodes.new('ShaderNodeMath')
+    hash_sum.operation = 'ADD'
+    hash_sum.location = (x + 300, y - 270)
+
+    hash_sin = tree.nodes.new('ShaderNodeMath')
+    hash_sin.operation = 'SINE'
+    hash_sin.location = (x + 450, y - 270)
+
+    hash_scale = tree.nodes.new('ShaderNodeMath')
+    hash_scale.operation = 'MULTIPLY'
+    hash_scale.location = (x + 600, y - 270)
+    hash_scale.inputs[1].default_value = OBJ_HASH_SINE_SCALE
+
+    hash_fract = tree.nodes.new('ShaderNodeMath')
+    hash_fract.operation = 'FRACT'
+    hash_fract.location = (x + 750, y - 270)
+
+    hash_weighted = tree.nodes.new('ShaderNodeMath')
+    hash_weighted.operation = 'MULTIPLY'
+    hash_weighted.location = (x + 900, y - 270)
+    hash_weighted.inputs[1].default_value = OBJ_HASH_WEIGHT
+
+    obj_id = tree.nodes.new('ShaderNodeMath')
+    obj_id.name = "lzla_obj_id"
+    obj_id.operation = 'ADD'
+    obj_id.location = (x + 300, y - 80)
+
+    obj_seed = tree.nodes.new('ShaderNodeMath')
+    obj_seed.name = "lzla_obj_seed"
+    obj_seed.operation = 'MULTIPLY'
+    obj_seed.location = (x + 500, y)
+    tree.links.new(panel_seed_socket, obj_seed.inputs[0])
+
+    tree.links.new(obj_info.outputs["Location"], loc_split.inputs[0])
+    tree.links.new(loc_split.outputs["X"], hash_x.inputs[0])
+    tree.links.new(loc_split.outputs["Y"], hash_y.inputs[0])
+    tree.links.new(loc_split.outputs["Z"], hash_z.inputs[0])
+    tree.links.new(hash_x.outputs[0], hash_sum.inputs[0])
+    tree.links.new(hash_y.outputs[0], hash_sum.inputs[1])
+    hash_sum_z = tree.nodes.new('ShaderNodeMath')
+    hash_sum_z.operation = 'ADD'
+    hash_sum_z.location = (x + 300, y - 370)
+    tree.links.new(hash_sum.outputs[0], hash_sum_z.inputs[0])
+    tree.links.new(hash_z.outputs[0], hash_sum_z.inputs[1])
+    tree.links.new(hash_sum_z.outputs[0], hash_sin.inputs[0])
+    tree.links.new(hash_sin.outputs[0], hash_scale.inputs[0])
+    tree.links.new(hash_scale.outputs[0], hash_fract.inputs[0])
+    tree.links.new(hash_fract.outputs[0], hash_weighted.inputs[0])
+    tree.links.new(obj_info.outputs["Object Index"], obj_id.inputs[0])
+    tree.links.new(hash_weighted.outputs[0], obj_id.inputs[1])
+    tree.links.new(obj_id.outputs[0], obj_seed.inputs[1])
+
+    return obj_seed.outputs[0]
+
+
 def _build_grunge_mask(props):
     """Black/white hard-stepped procedural grunge, used as the grunge view
     layer's override. Emission-based so lighting doesn't affect the mask.
-    Two noise harmonics (coarse patch + fine rugged) are scaled by separate
-    amplitudes, summed, and hard-stepped through a single threshold. The
-    seed drives the 4D noise W channel so varying it reshuffles the pattern
-    without moving it spatially."""
+    Patch and rugged are summed and hard-stepped; scatter is a separate
+    harmonic, hard-stepped on its own, then unioned in. Coordinates are
+    tilted off mesh axes and all noise runs without distortion to avoid
+    linear banding. The panel seed is multiplied by each object's index
+    plus an origin-position hash."""
     mat = _ensure_material(MAT_GRUNGE_MASK)
     tree = mat.node_tree
     tree.nodes.clear()
 
     coords = tree.nodes.new('ShaderNodeTexCoord')
-    coords.location = (-850, 0)
+    coords.location = (-1000, 0)
 
     seed = tree.nodes.new('ShaderNodeValue')
     seed.name = "lzla_seed"
     seed.label = "Grunge Seed"
     seed.outputs[0].default_value = props.grunge_seed
-    seed.location = (-850, -250)
+    seed.location = (-1000, -250)
 
-    seed_offset = tree.nodes.new('ShaderNodeMath')
-    seed_offset.operation = 'ADD'
-    seed_offset.location = (-650, -350)
-    seed_offset.inputs[1].default_value = RUGGED_SEED_OFFSET
-    tree.links.new(seed.outputs[0], seed_offset.inputs[0])
+    obj_info = tree.nodes.new('ShaderNodeObjectInfo')
+    obj_info.location = (-1000, -450)
+
+    obj_seed_value = _build_object_seed_modifier(
+        tree, seed.outputs[0], obj_info, -800, -250,
+    )
+
+    main_coords = _tilted_object_coords(
+        tree, coords.outputs["Object"], GRUNGE_COORD_ROTATION_MAIN,
+        -850, 0, "lzla_grunge_coords_main",
+    )
+    scatter_coords = _tilted_object_coords(
+        tree, coords.outputs["Object"], GRUNGE_COORD_ROTATION_SCATTER,
+        -850, -200, "lzla_grunge_coords_scatter",
+    )
+
+    rugged_seed = tree.nodes.new('ShaderNodeMath')
+    rugged_seed.operation = 'ADD'
+    rugged_seed.location = (-650, -350)
+    rugged_seed.inputs[1].default_value = RUGGED_SEED_OFFSET
+    tree.links.new(obj_seed_value, rugged_seed.inputs[0])
+
+    scatter_seed = tree.nodes.new('ShaderNodeMath')
+    scatter_seed.operation = 'ADD'
+    scatter_seed.location = (-650, -550)
+    scatter_seed.inputs[1].default_value = DOT_SEED_OFFSET
+    tree.links.new(obj_seed_value, scatter_seed.inputs[0])
 
     patch_noise = tree.nodes.new('ShaderNodeTexNoise')
     patch_noise.name = "lzla_patch_noise"
-    patch_noise.noise_dimensions = '4D'
-    patch_noise.location = (-600, 150)
-    _set_node_input(patch_noise, "Scale", props.grunge_patch_scale)
-    tree.links.new(coords.outputs["Object"], patch_noise.inputs["Vector"])
-    tree.links.new(seed.outputs[0], patch_noise.inputs["W"])
+    patch_noise.location = (-750, 200)
+    _configure_main_grunge_noise(patch_noise, props.grunge_patch_scale)
+    tree.links.new(main_coords, patch_noise.inputs["Vector"])
+    tree.links.new(obj_seed_value, patch_noise.inputs["W"])
 
     patch_amp = tree.nodes.new('ShaderNodeMath')
     patch_amp.name = "lzla_patch_amp"
     patch_amp.operation = 'MULTIPLY'
-    patch_amp.location = (-400, 150)
+    patch_amp.location = (-550, 200)
     patch_amp.inputs[1].default_value = props.grunge_patch_amplitude
     tree.links.new(patch_noise.outputs["Fac"], patch_amp.inputs[0])
 
     rugged_noise = tree.nodes.new('ShaderNodeTexNoise')
     rugged_noise.name = "lzla_rugged_noise"
-    rugged_noise.noise_dimensions = '4D'
-    rugged_noise.location = (-600, -150)
-    _set_node_input(rugged_noise, "Scale", props.grunge_rugged_scale)
-    tree.links.new(coords.outputs["Object"], rugged_noise.inputs["Vector"])
-    tree.links.new(seed_offset.outputs[0], rugged_noise.inputs["W"])
+    rugged_noise.location = (-750, -50)
+    _configure_main_grunge_noise(rugged_noise, props.grunge_rugged_scale)
+    tree.links.new(main_coords, rugged_noise.inputs["Vector"])
+    tree.links.new(rugged_seed.outputs[0], rugged_noise.inputs["W"])
 
     rugged_amp = tree.nodes.new('ShaderNodeMath')
     rugged_amp.name = "lzla_rugged_amp"
     rugged_amp.operation = 'MULTIPLY'
-    rugged_amp.location = (-400, -150)
+    rugged_amp.location = (-550, -50)
     rugged_amp.inputs[1].default_value = props.grunge_rugged_amplitude
     tree.links.new(rugged_noise.outputs["Fac"], rugged_amp.inputs[0])
+
+    scatter_fac = _build_blurred_scatter_fac(
+        tree, scatter_coords, scatter_seed.outputs[0],
+        props.grunge_noise_scale, props.grunge_noise_blur, -750, -300,
+    )
+
+    scatter_amp = tree.nodes.new('ShaderNodeMath')
+    scatter_amp.name = "lzla_grunge_noise_amp"
+    scatter_amp.operation = 'MULTIPLY'
+    scatter_amp.location = (-550, -300)
+    scatter_amp.inputs[1].default_value = props.grunge_noise_intensity
+    tree.links.new(scatter_fac, scatter_amp.inputs[0])
 
     combine = tree.nodes.new('ShaderNodeMath')
     combine.name = "lzla_combine"
     combine.operation = 'ADD'
-    combine.location = (-200, 0)
+    combine.location = (-350, 50)
     tree.links.new(patch_amp.outputs[0], combine.inputs[0])
     tree.links.new(rugged_amp.outputs[0], combine.inputs[1])
 
-    ramp = tree.nodes.new('ShaderNodeValToRGB')
-    ramp.name = "lzla_ramp"
-    ramp.location = (0, 0)
-    ramp.color_ramp.interpolation = 'CONSTANT'
-    ramp.color_ramp.elements[0].position = 0.0
-    ramp.color_ramp.elements[0].color = (1.0, 1.0, 1.0, 1.0)
-    ramp.color_ramp.elements[1].position = props.grunge_threshold
-    ramp.color_ramp.elements[1].color = (0.0, 0.0, 0.0, 1.0)
-    tree.links.new(combine.outputs[0], ramp.inputs["Fac"])
+    main_ramp = tree.nodes.new('ShaderNodeValToRGB')
+    main_ramp.name = "lzla_ramp"
+    main_ramp.location = (-150, 50)
+    main_ramp.color_ramp.interpolation = 'CONSTANT'
+    main_ramp.color_ramp.elements[0].position = 0.0
+    main_ramp.color_ramp.elements[0].color = (1.0, 1.0, 1.0, 1.0)
+    main_ramp.color_ramp.elements[1].position = props.grunge_threshold
+    main_ramp.color_ramp.elements[1].color = (0.0, 0.0, 0.0, 1.0)
+    tree.links.new(combine.outputs[0], main_ramp.inputs["Fac"])
+
+    scatter_ramp = tree.nodes.new('ShaderNodeValToRGB')
+    scatter_ramp.name = "lzla_grunge_noise_ramp"
+    scatter_ramp.location = (-150, -300)
+    _apply_scatter_ramp(scatter_ramp)
+    tree.links.new(scatter_amp.outputs[0], scatter_ramp.inputs["Fac"])
+
+    union, factor, a, b, union_out = _mix_rgba(tree, 'MULTIPLY')
+    union.name = "lzla_grunge_union"
+    union.location = (50, 0)
+    factor.default_value = 1.0
+    tree.links.new(main_ramp.outputs["Color"], a)
+    tree.links.new(scatter_ramp.outputs["Color"], b)
 
     emission = tree.nodes.new('ShaderNodeEmission')
-    emission.location = (250, 0)
-    tree.links.new(ramp.outputs["Color"], emission.inputs["Color"])
+    emission.location = (300, 0)
+    tree.links.new(union_out, emission.inputs["Color"])
 
     output = tree.nodes.new('ShaderNodeOutputMaterial')
     output.location = (500, 0)
@@ -384,11 +645,12 @@ def _build_lineart_collection(context, props):
     if lineart is None:
         lineart = gp_object.modifiers.new(LINEART_MOD_NAME, 'LINEART')
     lineart.show_viewport = True  # may have been left off by a deferred-update suspension
+    lineart.show_render = True
     lineart.source_type = 'SCENE'
     lineart.use_contour = True
     lineart.use_crease = True
     lineart.use_intersection = True
-    lineart.use_material = False
+    lineart.use_material = True
     lineart.use_loose = False
     lineart.crease_threshold = props.crease_angle
     lineart.radius = props.stroke_radius
@@ -401,6 +663,8 @@ def _build_lineart_collection(context, props):
         stroke_filter = gp_object.modifiers.new(FILTER_MOD_NAME, 'NODES')
     stroke_filter.node_group = filter_tree
     stroke_filter[min_length_id] = props.min_stroke_length
+    stroke_filter.show_viewport = True
+    stroke_filter.show_render = True
 
     return collection, gp_object
 
@@ -490,7 +754,7 @@ def _build_edge_detect_group(props):
     threshold.max_value = 1.0
     thickness = tree.interface.new_socket("Thickness", in_out='INPUT',
                                           socket_type='NodeSocketFloat')
-    thickness.default_value = 3.0
+    thickness.default_value = 4.0
     thickness.min_value = 1.0
     thickness.max_value = 32.0
     tree.interface.new_socket("Mask", in_out='OUTPUT', socket_type='NodeSocketFloat')
@@ -738,16 +1002,32 @@ def _sync_settings(scene):
             seed.outputs[0].default_value = props.grunge_seed
         patch_noise = grunge.node_tree.nodes.get("lzla_patch_noise")
         if patch_noise is not None:
-            _set_node_input(patch_noise, "Scale", props.grunge_patch_scale)
+            _configure_main_grunge_noise(patch_noise, props.grunge_patch_scale)
         patch_amp = grunge.node_tree.nodes.get("lzla_patch_amp")
         if patch_amp is not None:
             patch_amp.inputs[1].default_value = props.grunge_patch_amplitude
         rugged_noise = grunge.node_tree.nodes.get("lzla_rugged_noise")
         if rugged_noise is not None:
-            _set_node_input(rugged_noise, "Scale", props.grunge_rugged_scale)
+            _configure_main_grunge_noise(rugged_noise, props.grunge_rugged_scale)
         rugged_amp = grunge.node_tree.nodes.get("lzla_rugged_amp")
         if rugged_amp is not None:
             rugged_amp.inputs[1].default_value = props.grunge_rugged_amplitude
+        blur_r = grunge.node_tree.nodes.get("lzla_grunge_noise_blur_r")
+        if blur_r is not None:
+            blur_r.outputs[0].default_value = props.grunge_noise_blur * GRUNGE_BLUR_RADIUS_SCALE
+        scatter_noise = grunge.node_tree.nodes.get("lzla_grunge_noise")
+        if scatter_noise is not None:
+            _configure_grunge_noise(scatter_noise, props.grunge_noise_scale)
+        for suffix in ("_px", "_nx", "_py", "_ny"):
+            tap = grunge.node_tree.nodes.get(f"lzla_grunge_noise{suffix}")
+            if tap is not None:
+                _configure_grunge_noise(tap, props.grunge_noise_scale)
+        scatter_amp = grunge.node_tree.nodes.get("lzla_grunge_noise_amp")
+        if scatter_amp is not None:
+            scatter_amp.inputs[1].default_value = props.grunge_noise_intensity
+        scatter_ramp = grunge.node_tree.nodes.get("lzla_grunge_noise_ramp")
+        if scatter_ramp is not None:
+            _apply_scatter_ramp(scatter_ramp)
         ramp = grunge.node_tree.nodes.get("lzla_ramp")
         if ramp is not None:
             ramp.color_ramp.elements[1].position = props.grunge_threshold
@@ -810,11 +1090,18 @@ SYNC_DEBOUNCE_SECONDS = 0.35
 DEFER_POLL_SECONDS = 0.15
 
 
-def _tagged_lineart_modifiers():
+def _gp_line_modifiers():
+    """Line Art + stroke-filter modifiers on the tagged GP object."""
     gp_object = _find_tagged(bpy.data.objects, GP_CONTOURS)
     if gp_object is None:
         return []
-    return [mod for mod in gp_object.modifiers if mod.type == 'LINEART']
+    return list(gp_object.modifiers)
+
+
+def _refresh_gp_lines():
+    gp_object = _find_tagged(bpy.data.objects, GP_CONTOURS)
+    if gp_object is not None:
+        gp_object.update_tag()
 
 
 def _cancel_pending_sync():
@@ -823,7 +1110,7 @@ def _cancel_pending_sync():
 
 
 def _suspend_lineart_modifiers():
-    for mod in _tagged_lineart_modifiers():
+    for mod in _gp_line_modifiers():
         mod.show_viewport = False
     _defer_state["suspended"] = True
     _defer_state["scheduled"] = False
@@ -879,7 +1166,7 @@ def _run_defer_timer():
         _defer_state["scheduled"] = False
         return None
 
-    modifiers = _tagged_lineart_modifiers()
+    modifiers = _gp_line_modifiers()
     if not modifiers:
         _defer_state["scheduled"] = False
         _defer_state["suspended"] = False
@@ -897,7 +1184,9 @@ def _run_defer_timer():
         for mod in modifiers:
             if not mod.show_viewport:
                 mod.show_viewport = True
+            mod.show_render = True
         _defer_state["suspended"] = False
+        _refresh_gp_lines()
     _defer_state["scheduled"] = False
     return None
 
@@ -918,10 +1207,12 @@ def _on_depsgraph_update(scene, depsgraph):
 
 def _restore_suspended_modifiers():
     if _defer_state["suspended"]:
-        for mod in _tagged_lineart_modifiers():
+        for mod in _gp_line_modifiers():
             if not mod.show_viewport:
                 mod.show_viewport = True
+            mod.show_render = True
         _defer_state["suspended"] = False
+        _refresh_gp_lines()
     _defer_state["scheduled"] = False
     _defer_state["deadline"] = 0.0
 
@@ -1001,8 +1292,9 @@ class LINEART_OT_generate(Operator):
             return {'CANCELLED'}
 
         _sync_settings(scene)
-        for mod in _tagged_lineart_modifiers():
+        for mod in _gp_line_modifiers():
             mod.show_viewport = True
+            mod.show_render = True
         _defer_state["suspended"] = False
         gp_object.update_tag()
         context.view_layer.update()
@@ -1066,7 +1358,7 @@ class LazyLineartProps(PropertyGroup):
         update=_on_setting_changed,
     )
     stroke_radius: FloatProperty(
-        name="Stroke Radius", default=0.005, min=0.0, max=1.0, precision=4,
+        name="Stroke Radius", default=0.01, min=0.0, max=1.0, precision=4,
         description="Radius of the generated Line Art strokes",
         update=_on_setting_changed,
     )
@@ -1089,7 +1381,7 @@ class LazyLineartProps(PropertyGroup):
         update=_on_setting_changed,
     )
     shadow_line_thickness: FloatProperty(
-        name="Shadow Line Width", default=3.0, min=1.0, max=32.0, subtype='PIXEL',
+        name="Shadow Line Width", default=4.0, min=1.0, max=32.0, subtype='PIXEL',
         description="Thickness of the shadow contour lines, in pixels",
         update=_on_setting_changed,
     )
@@ -1106,7 +1398,7 @@ class LazyLineartProps(PropertyGroup):
         update=_on_setting_changed,
     )
     grunge_line_thickness: FloatProperty(
-        name="Grunge Line Width", default=3.0, min=1.0, max=32.0, subtype='PIXEL',
+        name="Grunge Line Width", default=4.0, min=1.0, max=32.0, subtype='PIXEL',
         description="Thickness of the grunge contour lines, in pixels",
         update=_on_setting_changed,
     )
@@ -1118,13 +1410,13 @@ class LazyLineartProps(PropertyGroup):
     )
     grunge_threshold: FloatProperty(
         name="Grunge Threshold", default=0.67, min=0.0, max=10.0,
-        description="Hard-step threshold on the summed noise (patch×amp1 + rugged×amp2) "
-                    "- lower covers more area",
+        description="Hard-step on the patch + rugged sum - lower covers more area",
         update=_on_setting_changed,
     )
     grunge_seed: FloatProperty(
-        name="Grunge Seed", default=0.0,
-        description="Reshuffles the placeholder grunge mask pattern",
+        name="Grunge Seed", default=1.0,
+        description="Base seed multiplied per object by (Object Index + origin "
+                    "position hash) - use non-zero values for visible variation",
         update=_on_setting_changed,
     )
     grunge_patch_scale: FloatProperty(
@@ -1145,6 +1437,23 @@ class LazyLineartProps(PropertyGroup):
     grunge_rugged_amplitude: FloatProperty(
         name="Grunge Rugged Amplitude", default=0.3, min=0.0, max=10.0,
         description="Weight of the rugged noise in the summed field",
+        update=_on_setting_changed,
+    )
+    grunge_noise_scale: FloatProperty(
+        name="Grunge Noise Scale", default=6.0, min=0.0,
+        description="Scale of the scatter harmonic (higher than patch = smaller, more "
+                    "isolated islands between clusters)",
+        update=_on_setting_changed,
+    )
+    grunge_noise_intensity: FloatProperty(
+        name="Grunge Noise Intensity", default=0.45, min=0.0, max=10.0,
+        description="Weight of the scatter harmonic before its hard-step at 0.5",
+        update=_on_setting_changed,
+    )
+    grunge_noise_blur: FloatProperty(
+        name="Grunge Noise Blur", default=0.08, min=0.0, max=0.5,
+        description="Box-blur radius applied to the scatter noise field before "
+                    "the hard threshold at 0.5",
         update=_on_setting_changed,
     )
     edge_threshold: FloatProperty(
@@ -1221,6 +1530,10 @@ class LINEART_PT_lazy_panel(Panel):
         col.label(text="Rugged Noise:")
         col.prop(props, "grunge_rugged_scale")
         col.prop(props, "grunge_rugged_amplitude")
+        col.label(text="Grunge Noise:")
+        col.prop(props, "grunge_noise_scale")
+        col.prop(props, "grunge_noise_intensity")
+        col.prop(props, "grunge_noise_blur")
         col.prop(props, "grunge_color")
         col.prop(props, "grunge_line_thickness")
         col.prop(props, "grunge_line_color")
