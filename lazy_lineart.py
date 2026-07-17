@@ -109,6 +109,31 @@ def _set_node_input(node, socket_names, value):
     return False
 
 
+def _group_input_socket(group_node, socket_name):
+    """Resolve a compositor group node input by its tree interface name."""
+    if group_node is None or group_node.node_tree is None:
+        return None
+    for item in group_node.node_tree.interface.items_tree:
+        if getattr(item, 'item_type', None) != 'SOCKET':
+            continue
+        if item.in_out != 'INPUT' or item.name != socket_name:
+            continue
+        return group_node.inputs.get(item.identifier)
+    return group_node.inputs.get(socket_name)
+
+
+def _set_group_input(group_node, socket_name, value):
+    """Set a group node input default, matching by interface socket name."""
+    socket = _group_input_socket(group_node, socket_name)
+    if socket is None:
+        return False
+    try:
+        socket.default_value = value
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _set_node_option(node, attr, socket_names, value_candidates):
     """Set a node option that may be an RNA enum property (pre-5.0) or a menu
     input socket (5.0 unified nodes), trying each candidate spelling."""
@@ -163,10 +188,12 @@ def _ensure_material(key):
 
 
 def _build_override_white(props):
-    """Toon-stepped matte white used as the shadow view layer's material
-    override: diffuse lighting is converted to luminance, hard-thresholded into
-    black/white, and emitted. The compositor keeps this pass soft for contour
-    detection and hard-steps it separately for the shadow fill tint."""
+    """Toon-stepped matte white for the shadow view layer override.
+
+    Diffuse lighting is converted to luminance and hard-stepped at
+    Shadow Threshold. The compositor blurs that pass, hard-steps again at
+    Edge Threshold, and uses the result for both shadow fill and contours
+    (same logic as the grunge pass)."""
     mat = _ensure_material(MAT_OVERRIDE_WHITE)
     tree = mat.node_tree
     tree.nodes.clear()
@@ -597,7 +624,8 @@ def _build_lineart_collection(context, props):
     lineart = gp_object.modifiers.get(LINEART_MOD_NAME)
     if lineart is None:
         lineart = gp_object.modifiers.new(LINEART_MOD_NAME, 'LINEART')
-    lineart.show_viewport = True  # may have been left off by a deferred-update suspension
+    mod_visible = props.live_updates
+    lineart.show_viewport = mod_visible
     lineart.show_render = True
     lineart.source_type = 'SCENE'
     lineart.use_contour = True
@@ -616,7 +644,7 @@ def _build_lineart_collection(context, props):
         stroke_filter = gp_object.modifiers.new(FILTER_MOD_NAME, 'NODES')
     stroke_filter.node_group = filter_tree
     stroke_filter[min_length_id] = props.min_stroke_length
-    stroke_filter.show_viewport = True
+    stroke_filter.show_viewport = mod_visible
     stroke_filter.show_render = True
 
     return collection, gp_object
@@ -785,17 +813,22 @@ def _over_white(tree, rl_node, x, y, name):
     return result
 
 
-def _shadow_fill_hard(tree, shadow_white, edge_threshold, x, y):
-    """Hard-step the soft shadow pass into a B&W color image for fill only.
+def _shadow_hard_mask(tree, shadow_white, edge_threshold, blur_radius, x, y):
+    """Blur the shadow pass, hard-step at Edge Threshold, return a B&W mask.
 
-    White pixels are lit, black pixels are shadow - same polarity as the soft
-    shadow pass when used as a Mix factor. Contour lines keep using the
-    original soft shadow_white image."""
+    The same mask drives shadow fill tinting and contour edge detection."""
+    blur = tree.nodes.new('CompositorNodeBlur')
+    blur.name = "lzla_shadow_blur"
+    blur.location = (x - 200, y)
+    _set_node_input(blur, ("Size", "Size_X"), blur_radius)
+    _set_node_input(blur, "Size_Y", blur_radius)
+    tree.links.new(shadow_white, blur.inputs["Image"])
+
     binarize = tree.nodes.new('ShaderNodeMath')
     binarize.name = "lzla_shadow_fill_mask"
     binarize.operation = 'GREATER_THAN'
     binarize.location = (x, y)
-    tree.links.new(shadow_white, binarize.inputs[0])
+    tree.links.new(blur.outputs["Image"], binarize.inputs[0])
     binarize.inputs[1].default_value = edge_threshold
 
     hard, factor, a, b, hard_image = _mix_rgba(tree)
@@ -805,7 +838,7 @@ def _shadow_fill_hard(tree, shadow_white, edge_threshold, x, y):
     b.default_value = (1.0, 1.0, 1.0, 1.0)
     tree.links.new(binarize.outputs[0], factor)
 
-    return hard_image
+    return hard_image, blur.outputs["Image"]
 
 
 def _build_compositor(context, props):
@@ -837,13 +870,13 @@ def _build_compositor(context, props):
     flat_white = _over_white(tree, render_layers["flat"], -700, 0, "lzla_flat_over_white")
     shadow_white = _over_white(tree, render_layers["shadow"], -700, -350, "lzla_shadow_over_white")
     grunge_white = _over_white(tree, render_layers["grunge"], -700, -700, "lzla_grunge_over_white")
-    shadow_fill_hard = _shadow_fill_hard(
-        tree, shadow_white, props.edge_threshold, -500, -350,
+    shadow_hard, shadow_for_edges = _shadow_hard_mask(
+        tree, shadow_white, props.edge_threshold, props.shadow_blur, -500, -350,
     )
 
     # Shadow/grunge passes are remapped to tint colors and multiplied onto the
-    # flat pass. Shadow fill is hard-stepped at Edge Threshold; contour lines
-    # still use the original soft shadow pass for clean edge detection.
+    # flat pass. Shadow uses a blurred-then-hard-stepped mask at Edge Threshold
+    # for both fill and contour lines (same logic as grunge).
     current = flat_white
 
     shadow_tint, factor, a, b, shadow_tint_out = _mix_rgba(tree)
@@ -851,7 +884,7 @@ def _build_compositor(context, props):
     shadow_tint.location = (-250, -350)
     a.default_value = tuple(props.shadow_color)
     b.default_value = (1.0, 1.0, 1.0, 1.0)
-    tree.links.new(shadow_fill_hard, factor)
+    tree.links.new(shadow_hard, factor)
 
     shadow_multiply, factor, a, b, shadow_multiply_out = _mix_rgba(tree, 'MULTIPLY')
     shadow_multiply.name = "lzla_shadow_multiply"
@@ -877,16 +910,18 @@ def _build_compositor(context, props):
     current = grunge_multiply_out
 
     for key, source, thickness, color in (
-        ("shadow", shadow_white, props.shadow_line_thickness, props.shadow_line_color),
+        ("shadow", shadow_for_edges, props.shadow_line_thickness, props.shadow_line_color),
         ("grunge", grunge_white, props.grunge_line_thickness, props.grunge_line_color),
     ):
         edges = tree.nodes.new('CompositorNodeGroup')
         edges.node_tree = edge_group
         edges.name = f"lzla_{key}_edges"
         edges.location = (-450, -350 if key == "shadow" else -700)
-        tree.links.new(source, edges.inputs["Image"])
-        edges.inputs["Threshold"].default_value = props.edge_threshold
-        edges.inputs["Thickness"].default_value = thickness
+        image_in = _group_input_socket(edges, "Image")
+        if image_in is not None:
+            tree.links.new(source, image_in)
+        _set_group_input(edges, "Threshold", props.edge_threshold)
+        _set_group_input(edges, "Thickness", thickness)
 
         line_mix, factor, a, b, line_out = _mix_rgba(tree)
         line_mix.name = f"lzla_{key}_line_mix"
@@ -987,6 +1022,10 @@ def _sync_settings(scene):
 
     comp = _find_tagged(bpy.data.node_groups, NG_COMPOSITOR)
     if comp is not None:
+        shadow_blur = comp.nodes.get("lzla_shadow_blur")
+        if shadow_blur is not None:
+            _set_node_input(shadow_blur, ("Size", "Size_X"), props.shadow_blur)
+            _set_node_input(shadow_blur, "Size_Y", props.shadow_blur)
         shadow_fill_mask = comp.nodes.get("lzla_shadow_fill_mask")
         if shadow_fill_mask is not None:
             shadow_fill_mask.inputs[1].default_value = props.edge_threshold
@@ -998,8 +1037,8 @@ def _sync_settings(scene):
         ):
             edges = comp.nodes.get(f"lzla_{key}_edges")
             if edges is not None:
-                _set_node_input(edges, "Threshold", props.edge_threshold)
-                _set_node_input(edges, "Thickness", line_thickness)
+                _set_group_input(edges, "Threshold", props.edge_threshold)
+                _set_group_input(edges, "Thickness", line_thickness)
             line_mix = comp.nodes.get(f"lzla_{key}_line_mix")
             if line_mix is not None:
                 for socket in line_mix.inputs:
@@ -1038,6 +1077,7 @@ def _sync_settings(scene):
 
 _sync_state = {"deadline": 0.0, "scheduled": False}
 _defer_state = {"deadline": 0.0, "scheduled": False, "suspended": False}
+_live_updates_paused = False
 
 SYNC_DEBOUNCE_SECONDS = 0.35
 DEFER_POLL_SECONDS = 0.15
@@ -1057,17 +1097,47 @@ def _refresh_gp_lines():
         gp_object.update_tag()
 
 
+def _set_line_modifiers_visible(viewport, render):
+    for mod in _gp_line_modifiers():
+        mod.show_viewport = viewport
+        mod.show_render = render
+
+
+def _suspend_lineart_modifiers(*, live_off=False):
+    global _live_updates_paused
+    _live_updates_paused = live_off
+    _set_line_modifiers_visible(False, True)
+    _defer_state["suspended"] = True
+    _defer_state["scheduled"] = False
+    _defer_state["deadline"] = 0.0
+
+
+def _restore_lineart_modifiers(*, force=False):
+    global _live_updates_paused
+    if _live_updates_paused and not force:
+        return
+    _live_updates_paused = False
+    _set_line_modifiers_visible(True, True)
+    _defer_state["suspended"] = False
+    _defer_state["scheduled"] = False
+    _defer_state["deadline"] = 0.0
+    _refresh_gp_lines()
+
+
 def _cancel_pending_sync():
     _sync_state["scheduled"] = False
     _sync_state["deadline"] = 0.0
 
 
-def _suspend_lineart_modifiers():
-    for mod in _gp_line_modifiers():
-        mod.show_viewport = False
-    _defer_state["suspended"] = True
-    _defer_state["scheduled"] = False
-    _defer_state["deadline"] = 0.0
+def _on_live_updates_changed(self, context):
+    if context is None:
+        return
+    if self.live_updates:
+        _restore_lineart_modifiers(force=True)
+        _cancel_pending_sync()
+    else:
+        _cancel_pending_sync()
+        _suspend_lineart_modifiers(live_off=True)
 
 
 def _run_sync_timer():
@@ -1115,7 +1185,7 @@ def _is_external_update(depsgraph):
 
 def _run_defer_timer():
     props = bpy.context.scene.lazy_lineart_props
-    if not props.live_updates:
+    if not props.live_updates or _live_updates_paused:
         _defer_state["scheduled"] = False
         return None
 
@@ -1128,15 +1198,13 @@ def _run_defer_timer():
     if time.monotonic() < _defer_state["deadline"]:
         if not _defer_state["suspended"]:
             for mod in modifiers:
-                if mod.show_viewport:
-                    mod.show_viewport = False
+                mod.show_viewport = False
             _defer_state["suspended"] = True
         return DEFER_POLL_SECONDS
 
     if _defer_state["suspended"]:
         for mod in modifiers:
-            if not mod.show_viewport:
-                mod.show_viewport = True
+            mod.show_viewport = True
             mod.show_render = True
         _defer_state["suspended"] = False
         _refresh_gp_lines()
@@ -1158,16 +1226,13 @@ def _on_depsgraph_update(scene, depsgraph):
         bpy.app.timers.register(_run_defer_timer, first_interval=0.0)
 
 
-def _restore_suspended_modifiers():
-    if _defer_state["suspended"]:
-        for mod in _gp_line_modifiers():
-            if not mod.show_viewport:
-                mod.show_viewport = True
-            mod.show_render = True
-        _defer_state["suspended"] = False
-        _refresh_gp_lines()
-    _defer_state["scheduled"] = False
-    _defer_state["deadline"] = 0.0
+def _lazy_lineart_load_post(_dummy):
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return
+    props = getattr(scene, "lazy_lineart_props", None)
+    if props is not None and not props.live_updates:
+        _suspend_lineart_modifiers(live_off=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1184,12 +1249,6 @@ class LINEART_OT_toggle_updates(Operator):
     def execute(self, context):
         props = context.scene.lazy_lineart_props
         props.live_updates = not props.live_updates
-        if props.live_updates:
-            _restore_suspended_modifiers()
-            _cancel_pending_sync()
-        else:
-            _cancel_pending_sync()
-            _suspend_lineart_modifiers()
 
         for window in context.window_manager.windows:
             for area in window.screen.areas:
@@ -1214,6 +1273,8 @@ class LINEART_OT_build_pipeline(Operator):
             _configure_view_layers(context, lineart_collection, props)
             _build_compositor(context, props)
             _sync_settings(context.scene)
+            if not props.live_updates:
+                _suspend_lineart_modifiers(live_off=True)
         except Exception as exc:
             traceback.print_exc()
             self.report({'ERROR'}, f"Build failed: {exc}")
@@ -1245,10 +1306,7 @@ class LINEART_OT_generate(Operator):
             return {'CANCELLED'}
 
         _sync_settings(scene)
-        for mod in _gp_line_modifiers():
-            mod.show_viewport = True
-            mod.show_render = True
-        _defer_state["suspended"] = False
+        _restore_lineart_modifiers(force=True)
         gp_object.update_tag()
         context.view_layer.update()
 
@@ -1324,7 +1382,13 @@ class LazyLineartProps(PropertyGroup):
     shadow_threshold: FloatProperty(
         name="Shadow Threshold", default=0.35, min=0.001, max=1.0,
         description="Diffuse light level below which the shadow pass counts as toon "
-                    "shadow (the compositor hardens the fill at Edge Threshold)",
+                    "shadow before compositor blur and hardening at Edge Threshold",
+        update=_on_setting_changed,
+    )
+    shadow_blur: FloatProperty(
+        name="Shadow Blur", default=2.0, min=0.0, max=32.0, subtype='PIXEL',
+        description="Pixel blur applied to the shadow pass before the hard Edge "
+                    "Threshold cut (fill and contour lines share this boundary)",
         update=_on_setting_changed,
     )
     shadow_color: FloatVectorProperty(
@@ -1424,6 +1488,7 @@ class LazyLineartProps(PropertyGroup):
         name="Live Updates", default=True,
         description="When off, panel sliders and scene edits no longer refresh Line Art "
                     "until you run Generate or turn updates back on",
+        update=_on_live_updates_changed,
     )
     use_deferred_updates: BoolProperty(
         name="Deferred Updates", default=True,
@@ -1468,6 +1533,7 @@ class LINEART_PT_lazy_panel(Panel):
         layout.label(text="Shadow Pass:")
         col = layout.column(align=True)
         col.prop(props, "shadow_threshold")
+        col.prop(props, "shadow_blur")
         col.prop(props, "shadow_color")
         col.prop(props, "shadow_line_thickness")
         col.prop(props, "shadow_line_color")
@@ -1532,12 +1598,17 @@ def register():
 
     if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+    if _lazy_lineart_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_lazy_lineart_load_post)
+    _lazy_lineart_load_post(None)
 
 
 def unregister():
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
-    _restore_suspended_modifiers()
+    if _lazy_lineart_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_lazy_lineart_load_post)
+    _restore_lineart_modifiers(force=True)
     _cancel_pending_sync()
 
     del bpy.types.Scene.lazy_lineart_props
