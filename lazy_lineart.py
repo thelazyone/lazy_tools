@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 8),
+    "version": (0, 1, 12),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -12,6 +12,7 @@ bl_info = {
 }
 
 import math
+import os
 import time
 import traceback
 from datetime import datetime
@@ -42,6 +43,7 @@ NG_STROKE_FILTER = f"{TAG}.ng.stroke_filter"
 NG_EDGE_DETECT = f"{TAG}.ng.edge_detect"
 NG_COMPOSITOR = f"{TAG}.ng.compositor"
 FILE_OUT_NAME = "lzla_file_out"
+FILE_OUT_SPLIT_NAME = "lzla_file_out_split"
 
 GP_LAYER_NAME = "Lines"
 LINEART_MOD_NAME = f"{TAG} Line Art"
@@ -828,14 +830,14 @@ def _math_maximum(tree, socket_a, socket_b, x, y, name):
     return node.outputs[0]
 
 
-def _lift_from_white_plate(tree, beauty, alpha, x, y):
+def _lift_from_white_plate(tree, beauty, alpha, x, y, prefix="lzla"):
     """Undo 'composite over white' using a soft coverage alpha.
 
     beauty = fg * a + white * (1 - a)  →  fg = (beauty - white * (1 - a)) / a
     Without this, Set Alpha alone leaves a white halo in AA'd line edges.
     """
     inv_a = tree.nodes.new('ShaderNodeMath')
-    inv_a.name = "lzla_alpha_inv"
+    inv_a.name = f"{prefix}_alpha_inv"
     inv_a.operation = 'SUBTRACT'
     inv_a.location = (x - 400, y - 120)
     inv_a.inputs[0].default_value = 1.0
@@ -843,21 +845,21 @@ def _lift_from_white_plate(tree, beauty, alpha, x, y):
 
     # white * (1 - a) as an RGB color
     white_part, factor, a_in, b_in, white_rgb = _mix_rgba(tree)
-    white_part.name = "lzla_white_part"
+    white_part.name = f"{prefix}_white_part"
     white_part.location = (x - 220, y - 120)
     a_in.default_value = (0.0, 0.0, 0.0, 1.0)
     b_in.default_value = (1.0, 1.0, 1.0, 1.0)
     tree.links.new(inv_a.outputs[0], factor)
 
     associated, factor, a_in, b_in, associated_rgb = _mix_rgba(tree, 'SUBTRACT')
-    associated.name = "lzla_lift_subtract"
+    associated.name = f"{prefix}_lift_subtract"
     associated.location = (x - 40, y)
     factor.default_value = 1.0
     tree.links.new(beauty, a_in)
     tree.links.new(white_rgb, b_in)
 
     safe_a = tree.nodes.new('ShaderNodeMath')
-    safe_a.name = "lzla_alpha_safe"
+    safe_a.name = f"{prefix}_alpha_safe"
     safe_a.operation = 'MAXIMUM'
     safe_a.location = (x - 400, y - 280)
     tree.links.new(alpha, safe_a.inputs[0])
@@ -865,28 +867,28 @@ def _lift_from_white_plate(tree, beauty, alpha, x, y):
 
     # 1 / safe_a, broadcast to RGB, multiply → straight color
     inv_safe = tree.nodes.new('ShaderNodeMath')
-    inv_safe.name = "lzla_alpha_rcp"
+    inv_safe.name = f"{prefix}_alpha_rcp"
     inv_safe.operation = 'DIVIDE'
     inv_safe.location = (x - 220, y - 280)
     inv_safe.inputs[0].default_value = 1.0
     tree.links.new(safe_a.outputs[0], inv_safe.inputs[1])
 
     scale, factor, a_in, b_in, scale_rgb = _mix_rgba(tree)
-    scale.name = "lzla_alpha_scale_rgb"
+    scale.name = f"{prefix}_alpha_scale_rgb"
     scale.location = (x - 40, y - 280)
     a_in.default_value = (0.0, 0.0, 0.0, 1.0)
     b_in.default_value = (1.0, 1.0, 1.0, 1.0)
     tree.links.new(inv_safe.outputs[0], factor)
 
     straight, factor, a_in, b_in, straight_rgb = _mix_rgba(tree, 'MULTIPLY')
-    straight.name = "lzla_lift_straight"
+    straight.name = f"{prefix}_lift_straight"
     straight.location = (x + 160, y)
     factor.default_value = 1.0
     tree.links.new(associated_rgb, a_in)
     tree.links.new(scale_rgb, b_in)
 
     set_alpha = tree.nodes.new('CompositorNodeSetAlpha')
-    set_alpha.name = "lzla_set_alpha"
+    set_alpha.name = f"{prefix}_set_alpha"
     set_alpha.location = (x + 360, y)
     if hasattr(set_alpha, "mode"):
         set_alpha.mode = 'REPLACE_ALPHA'
@@ -994,7 +996,12 @@ def _build_compositor(context, props):
     tree.links.new(grunge_tint_out, b)
     current = grunge_multiply_out
 
+    # Everything up to here is the "flats" side: fills + shadow/grunge tints,
+    # still composited over white. Kept for the split export.
+    flats_white = current
+
     edge_masks = []
+    lines_only = None  # contour lines over a plain white plate (split export)
     for key, source, thickness, color in (
         ("shadow", shadow_for_edges, props.shadow_line_thickness, props.shadow_line_color),
         ("grunge", grunge_white, props.grunge_line_thickness, props.grunge_line_color),
@@ -1018,11 +1025,30 @@ def _build_compositor(context, props):
         tree.links.new(current, a)
         current = line_out
 
+        # Same line mix, but stacked over white instead of over the flats.
+        split_mix, factor, a, b, split_out = _mix_rgba(tree)
+        split_mix.name = f"lzla_split_{key}_line_mix"
+        split_mix.location = (-50 if key == "shadow" else 150, -1050)
+        b.default_value = tuple(color)
+        tree.links.new(edges.outputs["Mask"], factor)
+        if lines_only is None:
+            a.default_value = (1.0, 1.0, 1.0, 1.0)
+        else:
+            tree.links.new(lines_only, a)
+        lines_only = split_out
+
     lines_mix, factor, a, b, lines_out = _mix_rgba(tree)
     lines_mix.name = "lzla_lines_mix"
     lines_mix.location = (350, 0)
     tree.links.new(render_layers["lines"].outputs["Alpha"], factor)
     tree.links.new(current, a)
+    tree.links.new(render_layers["lines"].outputs["Image"], b)
+
+    split_gp_mix, factor, a, b, split_lines_out = _mix_rgba(tree)
+    split_gp_mix.name = "lzla_split_lines_gp_mix"
+    split_gp_mix.location = (350, -1050)
+    tree.links.new(render_layers["lines"].outputs["Alpha"], factor)
+    tree.links.new(lines_only, a)
     tree.links.new(render_layers["lines"].outputs["Image"], b)
 
     # Combined coverage: mesh fill + GP strokes + morph edge bleed outside.
@@ -1036,7 +1062,21 @@ def _build_compositor(context, props):
             tree, alpha, mask, 350, -280 - 80 * i, f"lzla_alpha_edge_{i}",
         )
 
+    # Lines-only coverage: GP strokes + contour edge masks (no mesh fill).
+    lines_alpha = render_layers["lines"].outputs["Alpha"]
+    for i, mask in enumerate(edge_masks):
+        lines_alpha = _math_maximum(
+            tree, lines_alpha, mask, 350, -1250 - 80 * i, f"lzla_lines_alpha_edge_{i}",
+        )
+
     final = _lift_from_white_plate(tree, lines_out, alpha, 700, 0)
+    lines_final = _lift_from_white_plate(
+        tree, split_lines_out, lines_alpha, 700, -1050, prefix="lzla_lines",
+    )
+    flats_final = _lift_from_white_plate(
+        tree, flats_white, render_layers["flat"].outputs["Alpha"], 700, -1700,
+        prefix="lzla_flats",
+    )
 
     group_out = tree.nodes.new('NodeGroupOutput')
     group_out.location = (1100, 0)
@@ -1046,23 +1086,36 @@ def _build_compositor(context, props):
     viewer.location = (1100, -200)
     tree.links.new(final, viewer.inputs["Image"])
 
+    def _make_file_out(name, label, y, sources):
+        node = tree.nodes.new('CompositorNodeOutputFile')
+        node.name = name
+        node.label = label
+        node.location = (1100, y)
+        node.directory = "//"
+        node.file_name = "lazy_lineart"
+        while len(node.file_output_items) > 0:
+            node.file_output_items.remove(node.file_output_items[0])
+        # Link slots by name: the node keeps a virtual "add socket" input at
+        # the end of node.inputs, so positional indexing silently links to it.
+        for item_name, source in sources:
+            item = node.file_output_items.new('RGBA', item_name)
+            tree.links.new(source, node.inputs[item.name])
+        fmt = node.format
+        if hasattr(fmt, "media_type"):
+            fmt.media_type = 'IMAGE'
+        fmt.file_format = 'PNG'
+        fmt.color_mode = 'RGBA'
+        return node
+
     # Same image the Viewer sees — File Output writes it when you render.
-    file_out = tree.nodes.new('CompositorNodeOutputFile')
-    file_out.name = FILE_OUT_NAME
-    file_out.label = "Lazy Line Art PNG"
-    file_out.location = (1100, 200)
-    file_out.directory = "//"
-    file_out.file_name = "lazy_lineart"
-    while len(file_out.file_output_items) > 0:
-        file_out.file_output_items.remove(file_out.file_output_items[0])
-    slot_index = len(file_out.outputs)
-    file_out.file_output_items.new('RGBA', "Image")
-    tree.links.new(final, file_out.inputs[slot_index])
-    fmt = file_out.format
-    if hasattr(fmt, "media_type"):
-        fmt.media_type = 'IMAGE'
-    fmt.file_format = 'PNG'
-    fmt.color_mode = 'RGBA'
+    _make_file_out(FILE_OUT_NAME, "Lazy Line Art PNG", 200, (("Image", final),))
+    # Split export: lines (GP + shadow/grunge contours) and flats (fills +
+    # tints), each on its own transparent plate. Muted unless armed.
+    split_out = _make_file_out(
+        FILE_OUT_SPLIT_NAME, "Lazy Line Art Split PNGs", 500,
+        (("lines", lines_final), ("flats", flats_final)),
+    )
+    split_out.mute = True
 
     scene.compositing_node_group = tree
     scene.render.use_compositing = True
@@ -1070,26 +1123,38 @@ def _build_compositor(context, props):
     return tree
 
 
-def _arm_file_output(scene):
-    """Put a fresh timestamped path on the File Output node (next to the .blend)."""
+def _arm_file_output(scene, split=False):
+    """Put a fresh timestamped path on the requested File Output node (next to
+    the .blend) and mute the other one so only the requested files get written."""
     if not bpy.data.is_saved:
         return None, "Save the .blend first"
     comp = scene.compositing_node_group
     if comp is None or comp.get(ID_PROP) != NG_COMPOSITOR:
         return None, "Run Build Pipeline first"
-    node = comp.nodes.get(FILE_OUT_NAME)
+    armed_name = FILE_OUT_SPLIT_NAME if split else FILE_OUT_NAME
+    other_name = FILE_OUT_NAME if split else FILE_OUT_SPLIT_NAME
+    node = comp.nodes.get(armed_name)
     if node is None:
         return None, "File Output missing - run Build Pipeline"
+    other = comp.nodes.get(other_name)
+    if other is not None:
+        other.mute = True
+    node.mute = False
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    node.directory = "//"
-    node.file_name = f"lazy_lineart_{stamp}"
+    # Absolute path to the .blend's folder - the relative "//" prefix has
+    # proven unreliable on the File Output node in some setups.
+    blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
+    node.directory = blend_dir + os.sep
+    # Split slots are named "lines"/"flats", so the stamp lands before them:
+    # lazy_lineart_<stamp>_lines####.png / _flats####.png
+    node.file_name = f"lazy_lineart_{stamp}_" if split else f"lazy_lineart_{stamp}"
     fmt = node.format
     if hasattr(fmt, "media_type"):
         fmt.media_type = 'IMAGE'
     fmt.file_format = 'PNG'
     fmt.color_mode = 'RGBA'
-    return node.file_name, None
+    return node.directory + node.file_name, None
 
 
 # ----------------------------------------------------------------------------
@@ -1492,7 +1557,28 @@ class LINEART_OT_render_composite(Operator):
             return {'CANCELLED'}
         scene.render.use_compositing = True
         bpy.ops.render.render('INVOKE_DEFAULT')
-        self.report({'INFO'}, f"File Output → //{file_name}Image####.png")
+        self.report({'INFO'}, f"File Output → {file_name}Image.png")
+        return {'FINISHED'}
+
+
+class LINEART_OT_render_split(Operator):
+    bl_idname = "lazylineart.render_split"
+    bl_label = "Render Split (Lines / Flats)"
+    bl_description = (
+        "Render all view layers and write two timestamped transparent PNGs next "
+        "to the .blend: one with all the lines (Line Art strokes plus shadow and "
+        "grunge contours) and one with the flat colors and tints"
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        file_name, err = _arm_file_output(scene, split=True)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        scene.render.use_compositing = True
+        bpy.ops.render.render('INVOKE_DEFAULT')
+        self.report({'INFO'}, f"File Output → {file_name}lines.png + flats")
         return {'FINISHED'}
 
 
@@ -1663,6 +1749,7 @@ class LINEART_PT_lazy_panel(Panel):
         col.operator(LINEART_OT_build_pipeline.bl_idname, icon='MOD_BUILD')
         col.operator(LINEART_OT_generate.bl_idname, icon='MOD_LINEART')
         col.operator(LINEART_OT_render_composite.bl_idname, icon='RENDER_STILL')
+        col.operator(LINEART_OT_render_split.bl_idname, icon='RENDERLAYERS')
 
         layout.separator()
         layout.label(text="Strokes:")
@@ -1731,6 +1818,7 @@ classes = (
     LINEART_OT_build_pipeline,
     LINEART_OT_generate,
     LINEART_OT_render_composite,
+    LINEART_OT_render_split,
     LINEART_PT_lazy_panel,
 )
 
