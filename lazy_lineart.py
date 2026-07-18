@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 25),
+    "version": (0, 1, 33),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -42,6 +42,7 @@ MAT_GRUNGE_MASK = f"{TAG}.mat.grunge_mask"
 MAT_GP_LINES = f"{TAG}.mat.gp_lines"
 WORLD_DARK = f"{TAG}.world.dark"
 NG_STROKE_FILTER = f"{TAG}.ng.stroke_filter"
+NG_SCREEN_SPACE = f"{TAG}.ng.screen_space"
 NG_EDGE_DETECT = f"{TAG}.ng.edge_detect"
 NG_COMPOSITOR = f"{TAG}.ng.compositor"
 FILE_OUT_NAME = "lzla_file_out"
@@ -49,7 +50,9 @@ FILE_OUT_SPLIT_NAME = "lzla_file_out_split"
 
 GP_LAYER_NAME = "Lines"
 LINEART_MOD_NAME = f"{TAG} Line Art"
+THICKNESS_MOD_NAME = f"{TAG} Screen Space"
 FILTER_MOD_NAME = f"{TAG} Stroke Filter"
+MIN_SCREEN_SPACE_SCALE = 0.01
 UTILITY_LAYER_SAMPLES = 16
 RUGGED_SEED_OFFSET = 17.3
 DOT_SEED_OFFSET = 42.0
@@ -314,6 +317,207 @@ def _clear_node_tree(tree):
     interface = getattr(tree, "interface", None)
     if interface is not None:
         interface.clear()
+
+
+def _ensure_modifier_order(obj, ordered_names):
+    """Move modifiers so they appear top-to-bottom in `ordered_names`."""
+    for target_index, name in enumerate(ordered_names):
+        current_index = obj.modifiers.find(name)
+        if current_index != -1 and current_index != target_index:
+            obj.modifiers.move(current_index, target_index)
+
+
+
+def _lineart_base_radius(props):
+    """Base Line Art radius at Reference Distance (per-point scaling is in GN)."""
+    return max(props.stroke_radius, 0.0)
+
+
+def _gn_new_node(tree, type_names):
+    if isinstance(type_names, str):
+        type_names = (type_names,)
+    for type_name in type_names:
+        try:
+            return tree.nodes.new(type_name)
+        except RuntimeError:
+            continue
+    return None
+
+
+def _gn_require_node(tree, type_names):
+    node = _gn_new_node(tree, type_names)
+    if node is None:
+        raise RuntimeError(
+            f"Cannot create any of {type_names!r} in {getattr(tree, 'name', tree)!r}"
+        )
+    return node
+
+
+def _gn_socket(node, names, *, kind='output'):
+    sockets = node.outputs if kind == 'output' else node.inputs
+    for name in names:
+        if isinstance(name, int):
+            if -len(sockets) <= name < len(sockets):
+                return sockets[name]
+            continue
+        if name in sockets:
+            return sockets[name]
+    return sockets[0]
+
+
+def _gn_local_to_world(tree, local_pos, obj_info, x, y):
+    """GP-local point -> world space via Object Info transform matrix."""
+    transform = _gn_require_node(tree, 'FunctionNodeTransformPoint')
+    transform.location = (x, y)
+    tree.links.new(local_pos, _gn_socket(transform, ("Vector",), kind='input'))
+    tree.links.new(
+        _gn_socket(obj_info, ("Transform",)),
+        _gn_socket(transform, ("Transform",), kind='input'),
+    )
+    return _gn_socket(transform, ("Vector",))
+
+
+def _build_screen_space_thickness_group(props):
+    """Per-point screen-space scaling using camera-space Z (Blender 4.3+ method).
+
+    Matches the official Screen Space Thickness node group: transform each point
+    into active-camera space, take |Z| as view depth, then scale the Line Art
+    radius by (view_depth / reference_distance).
+    """
+    tree = _ensure_datablock(
+        bpy.data.node_groups, NG_SCREEN_SPACE,
+        lambda: bpy.data.node_groups.new(NG_SCREEN_SPACE, 'GeometryNodeTree'),
+    )
+    _clear_node_tree(tree)
+
+    tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+
+    group_in = tree.nodes.new('NodeGroupInput')
+    group_in.location = (-1100, 0)
+    group_out = tree.nodes.new('NodeGroupOutput')
+    group_out.location = (900, 0)
+
+    ref_distance = tree.nodes.new('ShaderNodeValue')
+    ref_distance.name = "lzla_ref_distance"
+    ref_distance.label = "Reference Distance"
+    ref_distance.location = (-1100, -320)
+    ref_distance.outputs[0].default_value = props.thickness_reference_distance
+
+    active_cam = _gn_require_node(tree, 'GeometryNodeInputActiveCamera')
+    active_cam.location = (-1100, -500)
+
+    cam_info = _gn_require_node(tree, 'GeometryNodeObjectInfo')
+    cam_info.location = (-900, -500)
+    tree.links.new(
+        _gn_socket(active_cam, ("Active Camera",)),
+        _gn_socket(cam_info, ("Object",), kind='input'),
+    )
+
+    self_info = tree.nodes.new('GeometryNodeObjectInfo')
+    self_info.name = "lzla_self_info"
+    self_info.label = "GP Object"
+    self_info.location = (-1100, -680)
+
+    position = tree.nodes.new('GeometryNodeInputPosition')
+    position.location = (-900, -120)
+
+    input_radius = tree.nodes.new('GeometryNodeInputRadius')
+    input_radius.location = (-900, -320)
+
+    world_pos = _gn_local_to_world(
+        tree, _gn_socket(position, ("Position",)), self_info, -680, -120,
+    )
+
+    inv_cam = _gn_require_node(tree, 'FunctionNodeInvertMatrix')
+    inv_cam.location = (-460, -500)
+    tree.links.new(
+        _gn_socket(cam_info, ("Transform",)),
+        _gn_socket(inv_cam, ("Matrix",), kind='input'),
+    )
+
+    cam_pos = _gn_require_node(tree, 'FunctionNodeTransformPoint')
+    cam_pos.location = (-240, -120)
+    tree.links.new(world_pos, _gn_socket(cam_pos, ("Vector",), kind='input'))
+    tree.links.new(
+        _gn_socket(inv_cam, ("Matrix",)),
+        _gn_socket(cam_pos, ("Transform",), kind='input'),
+    )
+
+    separate = _gn_require_node(tree, 'ShaderNodeSeparateXYZ')
+    separate.location = (-20, -120)
+    tree.links.new(_gn_socket(cam_pos, ("Vector",)), _gn_socket(separate, ("Vector",), kind='input'))
+
+    depth_abs = _gn_require_node(tree, ('FunctionNodeFloatMath', 'ShaderNodeMath'))
+    depth_abs.operation = 'ABSOLUTE'
+    depth_abs.location = (180, -120)
+    tree.links.new(_gn_socket(separate, ("Z",)), depth_abs.inputs[0])
+
+    depth_scale = _gn_require_node(tree, ('FunctionNodeFloatMath', 'ShaderNodeMath'))
+    depth_scale.operation = 'DIVIDE'
+    depth_scale.location = (380, -120)
+    tree.links.new(depth_abs.outputs[0], depth_scale.inputs[0])
+    tree.links.new(ref_distance.outputs[0], depth_scale.inputs[1])
+
+    clamp_scale = _gn_require_node(tree, ('FunctionNodeFloatMath', 'ShaderNodeMath'))
+    clamp_scale.operation = 'MAXIMUM'
+    clamp_scale.location = (580, -120)
+    clamp_scale.inputs[1].default_value = MIN_SCREEN_SPACE_SCALE
+    tree.links.new(depth_scale.outputs[0], clamp_scale.inputs[0])
+
+    final_scale = clamp_scale.outputs[0]
+    cam_data = _gn_new_node(tree, 'GeometryNodeCameraInfo')
+    if cam_data is not None:
+        cam_data.name = "lzla_cam_data"
+        cam_data.label = "Camera Data"
+        cam_data.location = (580, -320)
+        tree.links.new(
+            _gn_socket(active_cam, ("Active Camera",)),
+            _gn_socket(cam_data, ("Camera",), kind='input'),
+        )
+        persp_switch = _gn_new_node(tree, 'GeometryNodeSwitch')
+        if persp_switch is not None:
+            persp_switch.input_type = 'FLOAT'
+            persp_switch.location = (780, -120)
+            tree.links.new(
+                _gn_socket(cam_data, ("Is Orthographic",)),
+                _gn_socket(persp_switch, ("Switch",), kind='input'),
+            )
+            tree.links.new(clamp_scale.outputs[0], _gn_socket(persp_switch, ("False",), kind='input'))
+            persp_switch.inputs["True"].default_value = 1.0
+            final_scale = _gn_socket(persp_switch, ("Output",))
+
+    scaled_radius = _gn_require_node(tree, ('FunctionNodeFloatMath', 'ShaderNodeMath'))
+    scaled_radius.operation = 'MULTIPLY'
+    scaled_radius.location = (780, -320)
+    tree.links.new(_gn_socket(input_radius, ("Radius",)), scaled_radius.inputs[0])
+    tree.links.new(final_scale, scaled_radius.inputs[1])
+
+    set_radius = _gn_require_node(tree, 'GeometryNodeSetCurveRadius')
+    set_radius.location = (780, 0)
+    tree.links.new(group_in.outputs["Geometry"], _gn_socket(set_radius, ("Geometry",), kind='input'))
+    tree.links.new(scaled_radius.outputs[0], _gn_socket(set_radius, ("Radius",), kind='input'))
+    tree.links.new(_gn_socket(set_radius, ("Geometry",)), group_out.inputs["Geometry"])
+
+    return tree
+
+
+def _sync_screen_space_thickness(scene, props, gp_object):
+    """Push panel/object references into the screen-space node group."""
+    if gp_object is None:
+        return
+    thickness_mod = gp_object.modifiers.get(THICKNESS_MOD_NAME)
+    if thickness_mod is None or thickness_mod.node_group is None:
+        return
+
+    tree = thickness_mod.node_group
+    ref = tree.nodes.get("lzla_ref_distance")
+    if ref is not None:
+        ref.outputs[0].default_value = max(props.thickness_reference_distance, 1e-4)
+
+    self_node = tree.nodes.get("lzla_self_info")
+    if self_node is not None:
+        self_node.inputs["Object"].default_value = gp_object
 
 
 # ----------------------------------------------------------------------------
@@ -727,7 +931,7 @@ def _build_dark_world():
 
 
 # ----------------------------------------------------------------------------
-# Grease Pencil object + Line Art + stroke filter
+# Grease Pencil object + Line Art + screen-space thickness + stroke filter
 # ----------------------------------------------------------------------------
 
 def _build_stroke_filter_group(props):
@@ -817,9 +1021,18 @@ def _build_lineart_collection(context, props):
     lineart.use_material = True
     lineart.use_loose = False
     lineart.crease_threshold = props.crease_angle
-    lineart.radius = props.stroke_radius
+    lineart.radius = _lineart_base_radius(props)
     lineart.target_layer = layer.name
     lineart.target_material = line_material
+
+    thickness_tree = _build_screen_space_thickness_group(props)
+    thickness_mod = gp_object.modifiers.get(THICKNESS_MOD_NAME)
+    if thickness_mod is None:
+        thickness_mod = gp_object.modifiers.new(THICKNESS_MOD_NAME, 'NODES')
+    thickness_mod.node_group = thickness_tree
+    thickness_mod.show_viewport = mod_visible
+    thickness_mod.show_render = True
+    _sync_screen_space_thickness(scene, props, gp_object)
 
     filter_tree, min_length_id = _build_stroke_filter_group(props)
     stroke_filter = gp_object.modifiers.get(FILTER_MOD_NAME)
@@ -829,6 +1042,11 @@ def _build_lineart_collection(context, props):
     stroke_filter[min_length_id] = props.min_stroke_length
     stroke_filter.show_viewport = mod_visible
     stroke_filter.show_render = True
+
+    _ensure_modifier_order(
+        gp_object,
+        (LINEART_MOD_NAME, THICKNESS_MOD_NAME, FILTER_MOD_NAME),
+    )
 
     return collection, gp_object
 
@@ -1468,7 +1686,8 @@ def _sync_settings(scene):
         lineart = gp_object.modifiers.get(LINEART_MOD_NAME)
         if lineart is not None:
             lineart.crease_threshold = props.crease_angle
-            lineart.radius = props.stroke_radius
+            lineart.radius = _lineart_base_radius(props)
+        _sync_screen_space_thickness(scene, props, gp_object)
         stroke_filter = gp_object.modifiers.get(FILTER_MOD_NAME)
         if stroke_filter is not None and stroke_filter.node_group is not None:
             for item in stroke_filter.node_group.interface.items_tree:
@@ -1684,6 +1903,37 @@ def _on_setting_changed(self, context):
     if not _sync_state["scheduled"]:
         _sync_state["scheduled"] = True
         bpy.app.timers.register(_run_sync_timer, first_interval=0.05)
+
+
+def _apply_lineart_radius(context):
+    """Push stroke/thickness settings onto the Line Art modifier."""
+    scene = context.scene
+    props = scene.lazy_lineart_props
+    gp_object = _find_tagged(bpy.data.objects, GP_CONTOURS)
+    if gp_object is None:
+        return
+
+    lineart = gp_object.modifiers.get(LINEART_MOD_NAME)
+    if lineart is not None:
+        lineart.radius = _lineart_base_radius(props)
+    _sync_screen_space_thickness(scene, props, gp_object)
+
+    gp_object.update_tag()
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is not None:
+        view_layer.update()
+
+
+def _on_stroke_radius_changed(self, context):
+    if context is None:
+        return
+    _apply_lineart_radius(context)
+
+
+def _on_reference_distance_changed(self, context):
+    if context is None:
+        return
+    _apply_lineart_radius(context)
 
 
 def _on_shadow_threshold_changed(self, context):
@@ -1927,19 +2177,25 @@ class LINEART_OT_render_split(Operator):
 class LazyLineartProps(PropertyGroup):
     crease_angle: FloatProperty(
         name="Crease Threshold", subtype='ANGLE',
-        default=math.radians(90.0), min=0.0, max=math.pi,
+        default=math.radians(120.0), min=0.0, max=math.pi,
         description="Edges whose faces meet at less than this angle become crease lines",
         update=_on_setting_changed,
     )
     min_stroke_length: FloatProperty(
-        name="Min Stroke Length", default=0.075, min=0.0, subtype='DISTANCE',
+        name="Min Stroke Length", default=0.01, min=0.0, subtype='DISTANCE',
         description="Delete generated stroke chains shorter than this (scene units)",
         update=_on_setting_changed,
     )
     stroke_radius: FloatProperty(
         name="Stroke Radius", default=0.01, min=0.0, max=1.0, precision=4,
-        description="Radius of the generated Line Art strokes",
-        update=_on_setting_changed,
+        description="Base Line Art thickness at the Reference Distance",
+        update=_on_stroke_radius_changed,
+    )
+    thickness_reference_distance: FloatProperty(
+        name="Reference Distance", default=10.0, min=0.01, subtype='DISTANCE',
+        description="Camera-axis depth where Stroke Radius applies as-is; each stroke "
+                    "point scales by (its view depth / this value)",
+        update=_on_reference_distance_changed,
     )
     line_color: FloatVectorProperty(
         name="Line Color", subtype='COLOR', size=4,
@@ -2129,6 +2385,7 @@ class LINEART_PT_lazy_panel(Panel):
         col.prop(props, "crease_angle")
         col.prop(props, "min_stroke_length")
         col.prop(props, "stroke_radius")
+        col.prop(props, "thickness_reference_distance")
         col.prop(props, "line_color")
         col.prop(props, "bake_strokes")
 
