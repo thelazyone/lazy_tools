@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 21),
+    "version": (0, 1, 25),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -170,6 +170,100 @@ def _mix_rgba(tree, blend_type='MIX'):
     b = next(s for s in node.inputs if s.identifier == 'B_Color')
     result = next(s for s in node.outputs if s.identifier == 'Result_Color')
     return node, factor, a, b, result
+
+
+def _one_minus(tree, value, x, y, name):
+    inv = tree.nodes.new('ShaderNodeMath')
+    inv.name = name
+    inv.operation = 'SUBTRACT'
+    inv.location = (x, y)
+    inv.inputs[0].default_value = 1.0
+    tree.links.new(value, inv.inputs[1])
+    return inv.outputs[0]
+
+
+def _set_mix_b_color(mix_node, rgba):
+    """Write an RGBA tint into a Mix node's B_Color input."""
+    color = (rgba[0], rgba[1], rgba[2], rgba[3] if len(rgba) > 3 else 1.0)
+    for socket in mix_node.inputs:
+        if socket.identifier == 'B_Color':
+            socket.default_value = color
+            return True
+    color_inputs = [s for s in mix_node.inputs if s.type == 'RGBA']
+    if len(color_inputs) > 1:
+        color_inputs[1].default_value = color
+        return True
+    return False
+
+
+def _masked_multiply_tint(tree, base, apply_mask, tint_rgba, x, y, prefix):
+    """Where apply_mask=1, darken base with a per-channel multiply (keeps hue)."""
+    mult, m_factor, a, b, product = _mix_rgba(tree, 'MULTIPLY')
+    mult.name = f"{prefix}_mult"
+    mult.location = (x - 160, y)
+    m_factor.default_value = 1.0
+    b.default_value = (
+        tint_rgba[0], tint_rgba[1], tint_rgba[2],
+        tint_rgba[3] if len(tint_rgba) > 3 else 1.0,
+    )
+    tree.links.new(base, a)
+
+    pick, factor, a, b, result = _mix_rgba(tree)
+    pick.name = f"{prefix}_pick"
+    pick.location = (x, y)
+    tree.links.new(base, a)
+    tree.links.new(product, b)
+    tree.links.new(apply_mask, factor)
+    return result
+
+
+def _shadow_apply_mask(tree, lit_mask, x, y, name):
+    """Convert a lit=1 mask into a shadow=1 apply mask."""
+    return _one_minus(tree, lit_mask, x, y, name)
+
+
+def _rgb_to_luminance_value(tree, color_socket, x, y, name):
+    """Return a scalar luminance socket from an RGB/color image socket."""
+    for node_type in ('CompositorNodeRGBToBW', 'ShaderNodeRGBToBW'):
+        try:
+            node = tree.nodes.new(node_type)
+        except RuntimeError:
+            continue
+        node.name = name
+        node.location = (x, y)
+        color_in = node.inputs.get("Color") or node.inputs.get("Image") or node.inputs[0]
+        tree.links.new(color_socket, color_in)
+        return node.outputs.get("Val") or node.outputs.get("Value") or node.outputs[0]
+    raise RuntimeError(f"Cannot create an RGB-to-luminance node in {getattr(tree, 'name', tree)!r}")
+
+
+def _grunge_apply_mask(tree, grunge_white, x, y, prefix):
+    """Build a per-pixel mask that is 1 where the grunge pass should tint."""
+    lum = _rgb_to_luminance_value(
+        tree, grunge_white, x - 180, y, f"{prefix}_lum",
+    )
+    return _one_minus(tree, lum, x, y, f"{prefix}_apply")
+
+
+def _set_compositor_tint_color(comp, key, rgba):
+    """Push a tint color into the compositor nodes for one overlay pass."""
+    mult = comp.nodes.get(f"lzla_{key}_mult")
+    if mult is not None and _set_mix_b_color(mult, rgba):
+        return True
+    rgb = comp.nodes.get(f"lzla_{key}_tint_color")
+    if rgb is not None:
+        color = (rgba[0], rgba[1], rgba[2], rgba[3] if len(rgba) > 3 else 1.0)
+        if hasattr(rgb, "color"):
+            rgb.color = color[:3]
+        rgb.outputs[0].default_value = color
+        return True
+    tint = comp.nodes.get(f"lzla_{key}_tint")
+    if tint is not None:
+        color_inputs = [s for s in tint.inputs if s.type == 'RGBA']
+        if color_inputs:
+            color_inputs[0].default_value = tuple(rgba)
+            return True
+    return False
 
 
 def _link_toon_luminance_step(tree, luminance, threshold_name, threshold_value, x, y=0):
@@ -1064,7 +1158,7 @@ def _shadow_hard_mask(tree, shadow_white, edge_threshold, blur_radius, x, y,
     b.default_value = (1.0, 1.0, 1.0, 1.0)
     tree.links.new(binarize.outputs[0], factor)
 
-    return hard_image, blur.outputs["Image"]
+    return hard_image, blur.outputs["Image"], binarize.outputs[0]
 
 
 def _build_compositor(context, props):
@@ -1102,10 +1196,10 @@ def _build_compositor(context, props):
         tree, render_layers["hard_shadow"], -700, -700, "lzla_hard_shadow_over_white",
     )
     grunge_white = _over_white(tree, render_layers["grunge"], -700, -1050, "lzla_grunge_over_white")
-    shadow_hard, shadow_for_edges = _shadow_hard_mask(
+    _, shadow_for_edges, shadow_lit = _shadow_hard_mask(
         tree, shadow_white, props.edge_threshold, props.shadow_blur, -500, -350,
     )
-    hard_shadow_hard, hard_shadow_for_edges = _shadow_hard_mask(
+    _, hard_shadow_for_edges, hard_shadow_lit = _shadow_hard_mask(
         tree, hard_shadow_white, props.edge_threshold, props.hard_shadow_blur,
         -500, -700, prefix="lzla_hard_shadow",
     )
@@ -1117,54 +1211,26 @@ def _build_compositor(context, props):
 
     current = flat_white
 
-    shadow_tint, factor, a, b, shadow_tint_out = _mix_rgba(tree)
-    shadow_tint.name = "lzla_shadow_tint"
-    shadow_tint.location = (-250, -350)
-    a.default_value = tuple(props.shadow_color)
-    b.default_value = (1.0, 1.0, 1.0, 1.0)
-    tree.links.new(shadow_hard, factor)
-
-    shadow_multiply, factor, a, b, shadow_multiply_out = _mix_rgba(tree, 'MULTIPLY')
-    shadow_multiply.name = "lzla_shadow_multiply"
-    shadow_multiply.location = (-250, 0)
-    factor.default_value = 1.0
-    tree.links.new(current, a)
-    tree.links.new(shadow_tint_out, b)
-    current = shadow_multiply_out
-
-    hard_shadow_tint, factor, a, b, hard_shadow_tint_out = _mix_rgba(tree)
-    hard_shadow_tint.name = "lzla_hard_shadow_tint"
-    hard_shadow_tint.location = (-250, -700)
-    a.default_value = tuple(props.hard_shadow_color)
-    b.default_value = (1.0, 1.0, 1.0, 1.0)
-    hard_shadow_mask = _mask_passthrough_when_off(
-        tree, hard_shadow_hard, hard_shadow_enable.outputs[0],
-        -350, -700, "lzla_hard_shadow_fill",
+    shadow_apply = _shadow_apply_mask(tree, shadow_lit, -350, -350, "lzla_shadow_apply")
+    current = _masked_multiply_tint(
+        tree, current, shadow_apply, props.shadow_color, -250, -350, "lzla_shadow",
     )
-    tree.links.new(hard_shadow_mask, factor)
 
-    hard_shadow_multiply, factor, a, b, hard_shadow_multiply_out = _mix_rgba(tree, 'MULTIPLY')
-    hard_shadow_multiply.name = "lzla_hard_shadow_multiply"
-    hard_shadow_multiply.location = (-150, 0)
-    factor.default_value = 1.0
-    tree.links.new(current, a)
-    tree.links.new(hard_shadow_tint_out, b)
-    current = hard_shadow_multiply_out
+    hard_apply = _shadow_apply_mask(
+        tree, hard_shadow_lit, -350, -700, "lzla_hard_shadow_apply",
+    )
+    hard_apply = _gate_mask(
+        tree, hard_apply, hard_shadow_enable.outputs[0],
+        -320, -700, "lzla_hard_shadow_apply_gate",
+    )
+    current = _masked_multiply_tint(
+        tree, current, hard_apply, props.hard_shadow_color, -250, -700, "lzla_hard_shadow",
+    )
 
-    grunge_tint, factor, a, b, grunge_tint_out = _mix_rgba(tree)
-    grunge_tint.name = "lzla_grunge_tint"
-    grunge_tint.location = (-250, -1050)
-    a.default_value = tuple(props.grunge_color)
-    b.default_value = (1.0, 1.0, 1.0, 1.0)
-    tree.links.new(grunge_white, factor)
-
-    grunge_multiply, factor, a, b, grunge_multiply_out = _mix_rgba(tree, 'MULTIPLY')
-    grunge_multiply.name = "lzla_grunge_multiply"
-    grunge_multiply.location = (-50, 0)
-    factor.default_value = 1.0
-    tree.links.new(current, a)
-    tree.links.new(grunge_tint_out, b)
-    current = grunge_multiply_out
+    grunge_apply = _grunge_apply_mask(tree, grunge_white, -350, -1050, "lzla_grunge")
+    current = _masked_multiply_tint(
+        tree, current, grunge_apply, props.grunge_color, -250, -1050, "lzla_grunge",
+    )
 
     # Everything up to here is the "flats" side: fills + shadow/grunge tints,
     # still composited over white. Kept for the split export.
@@ -1488,12 +1554,7 @@ def _sync_settings(scene):
                     if socket.identifier == 'B_Color':
                         socket.default_value = tuple(line_color)
                         break
-            tint = comp.nodes.get(f"lzla_{key}_tint")
-            if tint is not None:
-                for socket in tint.inputs:
-                    if socket.identifier == 'A_Color':
-                        socket.default_value = tuple(tint_color)
-                        break
+        _sync_compositor_tint_colors(scene)
 
 
 # ----------------------------------------------------------------------------
@@ -1595,6 +1656,25 @@ def _run_sync_timer():
     except Exception:
         traceback.print_exc()
     return None
+
+
+def _sync_compositor_tint_colors(scene):
+    props = scene.lazy_lineart_props
+    comp = _find_tagged(bpy.data.node_groups, NG_COMPOSITOR)
+    if comp is None:
+        return
+    for key, tint_color in (
+        ("shadow", props.shadow_color),
+        ("hard_shadow", props.hard_shadow_color),
+        ("grunge", props.grunge_color),
+    ):
+        _set_compositor_tint_color(comp, key, tuple(tint_color))
+
+
+def _on_tint_color_changed(self, context):
+    if context is None:
+        return
+    _sync_compositor_tint_colors(context.scene)
 
 
 def _on_setting_changed(self, context):
@@ -1882,8 +1962,8 @@ class LazyLineartProps(PropertyGroup):
     shadow_color: FloatVectorProperty(
         name="Shadow Color", subtype='COLOR', size=4,
         default=(0.55, 0.55, 0.62, 1.0), min=0.0, max=1.0,
-        description="Tint multiplied onto flat colors in shaded regions (darkens)",
-        update=_on_setting_changed,
+        description="Multiplier on flat colors in shaded regions (per-channel, preserves hue)",
+        update=_on_tint_color_changed,
     )
     shadow_line_thickness: FloatProperty(
         name="Shadow Line Width", default=4.0, min=1.0, max=32.0, subtype='PIXEL',
@@ -1916,8 +1996,8 @@ class LazyLineartProps(PropertyGroup):
     hard_shadow_color: FloatVectorProperty(
         name="Hard Shadow Color", subtype='COLOR', size=4,
         default=(0.0, 0.0, 0.0, 1.0), min=0.0, max=1.0,
-        description="Tint multiplied onto flat colors in the deepest shadow (black)",
-        update=_on_setting_changed,
+        description="Multiplier on flat colors in the deepest shadow (per-channel)",
+        update=_on_tint_color_changed,
     )
     hard_shadow_line_thickness: FloatProperty(
         name="Hard Shadow Line Width", default=4.0, min=1.0, max=32.0, subtype='PIXEL',
@@ -1934,7 +2014,7 @@ class LazyLineartProps(PropertyGroup):
         name="Grunge Color", subtype='COLOR', size=4,
         default=(0.8, 0.78, 0.72, 1.0), min=0.0, max=1.0,
         description="Tint multiplied onto the flat colors inside grunge regions",
-        update=_on_setting_changed,
+        update=_on_tint_color_changed,
     )
     grunge_line_thickness: FloatProperty(
         name="Grunge Line Width", default=4.0, min=1.0, max=32.0, subtype='PIXEL',
