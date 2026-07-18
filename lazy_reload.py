@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Reloader",
     "author": "thelazyone",
-    "version": (0, 1, 3),
+    "version": (0, 1, 6),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Hard-reload addons that register panels in the Lazy Tools sidebar",
@@ -108,6 +108,9 @@ def _installed_addon_path(module_name):
     return None, False
 
 
+_updating_source_directory = False
+
+
 def _addon_prefs():
     """Find Lazy Reloader preferences even when installed as an extension."""
     prefs = bpy.context.preferences.addons
@@ -120,19 +123,45 @@ def _addon_prefs():
     return None
 
 
+def _save_userpref():
+    """Persist addon preferences so the folder survives new .blend files."""
+    try:
+        bpy.ops.wm.save_userpref()
+    except Exception as exc:
+        print(f"[Lazy Reloader] Could not save user preferences: {exc}")
+
+
+def _absolutize_directory(path):
+    path = (path or "").strip()
+    if not path:
+        return ""
+    return os.path.normpath(bpy.path.abspath(path))
+
+
+def _update_source_directory(self, context):
+    """Store an absolute path and write it into userpref.blend."""
+    global _updating_source_directory
+    if _updating_source_directory:
+        return
+
+    abs_path = _absolutize_directory(self.source_directory)
+    if abs_path != self.source_directory:
+        _updating_source_directory = True
+        try:
+            self.source_directory = abs_path
+        finally:
+            _updating_source_directory = False
+
+    _save_userpref()
+
+
 def _source_directory():
     """Folder where you edit Lazy Tools sources (git checkout, etc.)."""
     addon_prefs = _addon_prefs()
     if addon_prefs is not None:
-        path = addon_prefs.source_directory.strip()
+        path = _absolutize_directory(addon_prefs.source_directory)
         if path:
-            return bpy.path.abspath(path)
-
-    scene = getattr(bpy.context, "scene", None)
-    if scene is not None and hasattr(scene, "lazy_reload_props"):
-        path = scene.lazy_reload_props.source_directory.strip()
-        if path:
-            return bpy.path.abspath(path)
+            return path
 
     # Last resort: folder that contains this reloader file.
     return os.path.dirname(os.path.realpath(__file__))
@@ -336,27 +365,19 @@ class LazyReloadPreferences(AddonPreferences):
         name="Folder",
         description=(
             "Folder where you edit Lazy Tools .py files / packages "
-            "(e.g. C:\\Projects\\lazy_tools). Reload copies from here into "
-            "Blender's addons folder, then re-enables the addon"
+            "(e.g. C:\\Projects\\lazy_tools). Saved in Blender preferences "
+            "so it persists across new files"
         ),
         subtype="DIR_PATH",
         default="",
+        update=_update_source_directory,
     )
 
     def draw(self, context):
-        self.layout.prop(self, "source_directory", text="path")
+        self.layout.prop(self, "source_directory", text="Folder")
 
 
 class LazyReloadProps(PropertyGroup):
-    source_directory: StringProperty(
-        name="Folder",
-        description=(
-            "Folder where you edit Lazy Tools sources "
-            "(your git checkout). Required if Blender installed a copy elsewhere"
-        ),
-        subtype="DIR_PATH",
-        default="",
-    )
     target_addon: EnumProperty(
         name="Addon",
         description="Lazy Tools addon to hard-reload",
@@ -399,11 +420,16 @@ class LAZYRELOAD_OT_reload(Operator):
 
 
 class LAZYRELOAD_PT_panel(Panel):
-    bl_idname = "LAZYRELOAD_PT_panel"
+    # Leading "AAA_" wins alphabetical tie-break among bl_order == 0 panels.
+    bl_idname = "AAA_PT_lazy_reload"
     bl_label = "Lazy Reloader"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = LAZY_CATEGORY
+    # Must be >= 0 (negative values get clamped/wrapped and end up at the bottom).
+    bl_order = 0
+
+
 
     def draw(self, context):
         layout = self.layout
@@ -414,9 +440,9 @@ class LAZYRELOAD_PT_panel(Panel):
 
         row = layout.row(align=True)
         if addon_prefs is not None:
-            row.prop(addon_prefs, "source_directory", text="path")
+            row.prop(addon_prefs, "source_directory", text="Folder")
         else:
-            row.prop(props, "source_directory", text="path")
+            row.label(text="Enable addon to save Folder", icon="ERROR")
 
         row = layout.row(align=True)
         row.prop(props, "target_addon", text="")
