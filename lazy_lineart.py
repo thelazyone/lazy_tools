@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 19),
+    "version": (0, 1, 21),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -955,6 +955,18 @@ def _mask_passthrough_when_off(tree, mask, enable_socket, x, y, name_prefix):
     return result.outputs[0]
 
 
+def _composite_over(tree, background, foreground, x, y, name):
+    """Composite foreground over background with standard alpha-over."""
+    node = tree.nodes.new('CompositorNodeAlphaOver')
+    node.name = name
+    node.location = (x, y)
+    bg_in = node.inputs.get("Background") or node.inputs.get("Image") or node.inputs[1]
+    fg_in = node.inputs.get("Foreground") or node.inputs.get("Image_001") or node.inputs[2]
+    tree.links.new(background, bg_in)
+    tree.links.new(foreground, fg_in)
+    return node.outputs.get("Image") or node.outputs[0]
+
+
 def _lift_from_white_plate(tree, beauty, alpha, x, y, prefix="lzla"):
     """Undo 'composite over white' using a soft coverage alpha.
 
@@ -1082,8 +1094,8 @@ def _build_compositor(context, props):
         node.location = (-1100, -350 * row)
         render_layers[key] = node
 
-    # Beauty is still built over white (ramps/mixes need that). Transparency is
-    # restored at the end with max(flat alpha, GP alpha, edge-line masks).
+    # Beauty is still built over white (ramps/mixes need that). Flats and lines
+    # are lifted to straight RGBA plates separately, then alpha-over combines them.
     flat_white = _over_white(tree, render_layers["flat"], -700, 0, "lzla_flat_over_white")
     shadow_white = _over_white(tree, render_layers["shadow"], -700, -350, "lzla_shadow_over_white")
     hard_shadow_white = _over_white(
@@ -1159,7 +1171,7 @@ def _build_compositor(context, props):
     flats_white = current
 
     edge_masks = []
-    lines_only = None  # contour lines over a plain white plate (split export)
+    lines_only = None  # GP strokes + contour lines on a white plate (split export)
     edge_passes = (
         ("shadow", shadow_for_edges, props.shadow_line_thickness,
          props.shadow_line_color, -350, -50),
@@ -1186,15 +1198,6 @@ def _build_compositor(context, props):
             )
         edge_masks.append(edge_mask)
 
-        line_mix, factor, a, b, line_out = _mix_rgba(tree)
-        line_mix.name = f"lzla_{key}_line_mix"
-        line_mix.location = (line_x, 0)
-        b.default_value = tuple(color)
-        tree.links.new(edge_mask, factor)
-        tree.links.new(current, a)
-        current = line_out
-
-        # Same line mix, but stacked over white instead of over the flats.
         split_mix, factor, a, b, split_out = _mix_rgba(tree)
         split_mix.name = f"lzla_split_{key}_line_mix"
         split_mix.location = (line_x, -1400)
@@ -1206,13 +1209,6 @@ def _build_compositor(context, props):
             tree.links.new(lines_only, a)
         lines_only = split_out
 
-    lines_mix, factor, a, b, lines_out = _mix_rgba(tree)
-    lines_mix.name = "lzla_lines_mix"
-    lines_mix.location = (350, 0)
-    tree.links.new(render_layers["lines"].outputs["Alpha"], factor)
-    tree.links.new(current, a)
-    tree.links.new(render_layers["lines"].outputs["Image"], b)
-
     split_gp_mix, factor, a, b, split_lines_out = _mix_rgba(tree)
     split_gp_mix.name = "lzla_split_lines_gp_mix"
     split_gp_mix.location = (350, -1400)
@@ -1220,25 +1216,12 @@ def _build_compositor(context, props):
     tree.links.new(lines_only, a)
     tree.links.new(render_layers["lines"].outputs["Image"], b)
 
-    # Combined coverage: mesh fill + GP strokes + morph edge bleed outside.
-    alpha = render_layers["flat"].outputs["Alpha"]
-    alpha = _math_maximum(
-        tree, alpha, render_layers["lines"].outputs["Alpha"],
-        350, -200, "lzla_alpha_flat_lines",
-    )
-    for i, mask in enumerate(edge_masks):
-        alpha = _math_maximum(
-            tree, alpha, mask, 350, -280 - 80 * i, f"lzla_alpha_edge_{i}",
-        )
-
-    # Lines-only coverage: GP strokes + contour edge masks (no mesh fill).
     lines_alpha = render_layers["lines"].outputs["Alpha"]
     for i, mask in enumerate(edge_masks):
         lines_alpha = _math_maximum(
             tree, lines_alpha, mask, 350, -1250 - 80 * i, f"lzla_lines_alpha_edge_{i}",
         )
 
-    final = _lift_from_white_plate(tree, lines_out, alpha, 700, 0)
     lines_final = _lift_from_white_plate(
         tree, split_lines_out, lines_alpha, 700, -1400, prefix="lzla_lines",
     )
@@ -1246,6 +1229,7 @@ def _build_compositor(context, props):
         tree, flats_white, render_layers["flat"].outputs["Alpha"], 700, -1700,
         prefix="lzla_flats",
     )
+    final = _composite_over(tree, flats_final, lines_final, 900, 0, "lzla_final_over")
 
     group_out = tree.nodes.new('NodeGroupOutput')
     group_out.location = (1100, 0)
@@ -1496,7 +1480,9 @@ def _sync_settings(scene):
             if edges is not None:
                 _set_group_input(edges, "Threshold", props.edge_threshold)
                 _set_group_input(edges, "Thickness", line_thickness)
-            line_mix = comp.nodes.get(f"lzla_{key}_line_mix")
+            line_mix = comp.nodes.get(f"lzla_split_{key}_line_mix")
+            if line_mix is None:
+                line_mix = comp.nodes.get(f"lzla_{key}_line_mix")
             if line_mix is not None:
                 for socket in line_mix.inputs:
                     if socket.identifier == 'B_Color':
