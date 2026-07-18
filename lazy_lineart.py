@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 12),
+    "version": (0, 1, 13),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -33,9 +33,11 @@ COL_LINEART = f"{TAG}.col.lineart"
 GP_CONTOURS = f"{TAG}.gp.contours"
 VL_FLAT = f"{TAG}.vl.flat"
 VL_SHADOW = f"{TAG}.vl.shadow"
+VL_HARD_SHADOW = f"{TAG}.vl.hard_shadow"
 VL_GRUNGE = f"{TAG}.vl.grunge"
 VL_LINES = f"{TAG}.vl.lines"
 MAT_OVERRIDE_WHITE = f"{TAG}.mat.override_white"
+MAT_OVERRIDE_HARD_SHADOW = f"{TAG}.mat.override_hard_shadow"
 MAT_GRUNGE_MASK = f"{TAG}.mat.grunge_mask"
 MAT_GP_LINES = f"{TAG}.mat.gp_lines"
 WORLD_DARK = f"{TAG}.world.dark"
@@ -221,6 +223,49 @@ def _build_override_white(props):
     ramp.color_ramp.elements[0].position = 0.0
     ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
     ramp.color_ramp.elements[1].position = props.shadow_threshold
+    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+    tree.links.new(to_bw.outputs["Val"], ramp.inputs["Fac"])
+
+    emission = tree.nodes.new('ShaderNodeEmission')
+    emission.location = (300, 0)
+    tree.links.new(ramp.outputs["Color"], emission.inputs["Color"])
+
+    output = tree.nodes.new('ShaderNodeOutputMaterial')
+    output.location = (550, 0)
+    tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+    return mat
+
+
+def _build_override_hard_shadow(props):
+    """Toon-stepped matte white for the hard-shadow view layer override.
+
+    Same diffuse-to-luminance pipeline as the regular shadow pass, but stepped
+    at Hard Shadow Threshold so only the darkest lit regions register. The
+    compositor blurs that pass, hard-steps again at Edge Threshold, and uses
+    the result for fill tinting and contour lines."""
+    mat = _ensure_material(MAT_OVERRIDE_HARD_SHADOW)
+    tree = mat.node_tree
+    tree.nodes.clear()
+
+    diffuse = tree.nodes.new('ShaderNodeBsdfDiffuse')
+    diffuse.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    diffuse.location = (-500, 0)
+
+    to_rgb = tree.nodes.new('ShaderNodeShaderToRGB')
+    to_rgb.location = (-300, 0)
+    tree.links.new(diffuse.outputs["BSDF"], to_rgb.inputs["Shader"])
+
+    to_bw = tree.nodes.new('ShaderNodeRGBToBW')
+    to_bw.location = (-150, 0)
+    tree.links.new(to_rgb.outputs["Color"], to_bw.inputs["Color"])
+
+    ramp = tree.nodes.new('ShaderNodeValToRGB')
+    ramp.name = "lzla_hard_shadow_ramp"
+    ramp.location = (50, 0)
+    ramp.color_ramp.interpolation = 'CONSTANT'
+    ramp.color_ramp.elements[0].position = 0.0
+    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    ramp.color_ramp.elements[1].position = props.hard_shadow_threshold
     ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
     tree.links.new(to_bw.outputs["Val"], ramp.inputs["Fac"])
 
@@ -678,11 +723,13 @@ def _ensure_view_layer(scene, name):
 def _configure_view_layers(context, lineart_collection, props):
     scene = context.scene
     override_white = _build_override_white(props)
+    override_hard_shadow = _build_override_hard_shadow(props)
     grunge_mask = _build_grunge_mask(props)
     dark_world = _build_dark_world()
 
     vl_flat = _ensure_view_layer(scene, VL_FLAT)
     vl_shadow = _ensure_view_layer(scene, VL_SHADOW)
+    vl_hard_shadow = _ensure_view_layer(scene, VL_HARD_SHADOW)
     vl_grunge = _ensure_view_layer(scene, VL_GRUNGE)
     vl_lines = _ensure_view_layer(scene, VL_LINES)
 
@@ -692,7 +739,7 @@ def _configure_view_layers(context, lineart_collection, props):
     # remain in the image. Loose objects sitting directly in the scene root
     # collection can't be held out per-layer - keep scene content in
     # collections for a clean lines pass.
-    for view_layer in (vl_flat, vl_shadow, vl_grunge):
+    for view_layer in (vl_flat, vl_shadow, vl_hard_shadow, vl_grunge):
         lc = _layer_collection_for(view_layer.layer_collection, lineart_collection)
         if lc is not None:
             lc.exclude = True
@@ -705,14 +752,16 @@ def _configure_view_layers(context, lineart_collection, props):
     vl_flat.material_override = None
     vl_shadow.material_override = override_white
     vl_shadow.world_override = dark_world
+    vl_hard_shadow.material_override = override_hard_shadow
+    vl_hard_shadow.world_override = dark_world
     vl_grunge.material_override = grunge_mask
     vl_grunge.world_override = dark_world
     vl_lines.material_override = None
 
-    for view_layer in (vl_shadow, vl_grunge, vl_lines):
+    for view_layer in (vl_shadow, vl_hard_shadow, vl_grunge, vl_lines):
         view_layer.samples = UTILITY_LAYER_SAMPLES
 
-    return vl_flat, vl_shadow, vl_grunge, vl_lines
+    return vl_flat, vl_shadow, vl_hard_shadow, vl_grunge, vl_lines
 
 
 # ----------------------------------------------------------------------------
@@ -901,26 +950,27 @@ def _lift_from_white_plate(tree, beauty, alpha, x, y, prefix="lzla"):
     return set_alpha.outputs.get("Image") or set_alpha.outputs[0]
 
 
-def _shadow_hard_mask(tree, shadow_white, edge_threshold, blur_radius, x, y):
-    """Blur the shadow pass, hard-step at Edge Threshold, return a B&W mask.
+def _shadow_hard_mask(tree, shadow_white, edge_threshold, blur_radius, x, y,
+                      prefix="lzla_shadow"):
+    """Blur a toon shadow pass, hard-step at Edge Threshold, return a B&W mask.
 
-    The same mask drives shadow fill tinting and contour edge detection."""
+    The same mask drives fill tinting and contour edge detection."""
     blur = tree.nodes.new('CompositorNodeBlur')
-    blur.name = "lzla_shadow_blur"
+    blur.name = f"{prefix}_blur"
     blur.location = (x - 200, y)
     _set_node_input(blur, ("Size", "Size_X"), blur_radius)
     _set_node_input(blur, "Size_Y", blur_radius)
     tree.links.new(shadow_white, blur.inputs["Image"])
 
     binarize = tree.nodes.new('ShaderNodeMath')
-    binarize.name = "lzla_shadow_fill_mask"
+    binarize.name = f"{prefix}_fill_mask"
     binarize.operation = 'GREATER_THAN'
     binarize.location = (x, y)
     tree.links.new(blur.outputs["Image"], binarize.inputs[0])
     binarize.inputs[1].default_value = edge_threshold
 
     hard, factor, a, b, hard_image = _mix_rgba(tree)
-    hard.name = "lzla_shadow_fill_hard"
+    hard.name = f"{prefix}_fill_hard"
     hard.location = (x + 180, y)
     a.default_value = (0.0, 0.0, 0.0, 1.0)
     b.default_value = (1.0, 1.0, 1.0, 1.0)
@@ -946,7 +996,8 @@ def _build_compositor(context, props):
     render_layers = {}
     for row, (key, vl_name) in enumerate((
         ("flat", VL_FLAT), ("shadow", VL_SHADOW),
-        ("grunge", VL_GRUNGE), ("lines", VL_LINES),
+        ("hard_shadow", VL_HARD_SHADOW), ("grunge", VL_GRUNGE),
+        ("lines", VL_LINES),
     )):
         node = tree.nodes.new('CompositorNodeRLayers')
         node.name = f"lzla_rl_{key}"
@@ -959,9 +1010,16 @@ def _build_compositor(context, props):
     # restored at the end with max(flat alpha, GP alpha, edge-line masks).
     flat_white = _over_white(tree, render_layers["flat"], -700, 0, "lzla_flat_over_white")
     shadow_white = _over_white(tree, render_layers["shadow"], -700, -350, "lzla_shadow_over_white")
-    grunge_white = _over_white(tree, render_layers["grunge"], -700, -700, "lzla_grunge_over_white")
+    hard_shadow_white = _over_white(
+        tree, render_layers["hard_shadow"], -700, -700, "lzla_hard_shadow_over_white",
+    )
+    grunge_white = _over_white(tree, render_layers["grunge"], -700, -1050, "lzla_grunge_over_white")
     shadow_hard, shadow_for_edges = _shadow_hard_mask(
         tree, shadow_white, props.edge_threshold, props.shadow_blur, -500, -350,
+    )
+    hard_shadow_hard, hard_shadow_for_edges = _shadow_hard_mask(
+        tree, hard_shadow_white, props.edge_threshold, props.hard_shadow_blur,
+        -500, -700, prefix="lzla_hard_shadow",
     )
 
     current = flat_white
@@ -981,9 +1039,24 @@ def _build_compositor(context, props):
     tree.links.new(shadow_tint_out, b)
     current = shadow_multiply_out
 
+    hard_shadow_tint, factor, a, b, hard_shadow_tint_out = _mix_rgba(tree)
+    hard_shadow_tint.name = "lzla_hard_shadow_tint"
+    hard_shadow_tint.location = (-250, -700)
+    a.default_value = tuple(props.hard_shadow_color)
+    b.default_value = (1.0, 1.0, 1.0, 1.0)
+    tree.links.new(hard_shadow_hard, factor)
+
+    hard_shadow_multiply, factor, a, b, hard_shadow_multiply_out = _mix_rgba(tree, 'MULTIPLY')
+    hard_shadow_multiply.name = "lzla_hard_shadow_multiply"
+    hard_shadow_multiply.location = (-150, 0)
+    factor.default_value = 1.0
+    tree.links.new(current, a)
+    tree.links.new(hard_shadow_tint_out, b)
+    current = hard_shadow_multiply_out
+
     grunge_tint, factor, a, b, grunge_tint_out = _mix_rgba(tree)
     grunge_tint.name = "lzla_grunge_tint"
-    grunge_tint.location = (-250, -700)
+    grunge_tint.location = (-250, -1050)
     a.default_value = tuple(props.grunge_color)
     b.default_value = (1.0, 1.0, 1.0, 1.0)
     tree.links.new(grunge_white, factor)
@@ -1002,14 +1075,19 @@ def _build_compositor(context, props):
 
     edge_masks = []
     lines_only = None  # contour lines over a plain white plate (split export)
-    for key, source, thickness, color in (
-        ("shadow", shadow_for_edges, props.shadow_line_thickness, props.shadow_line_color),
-        ("grunge", grunge_white, props.grunge_line_thickness, props.grunge_line_color),
-    ):
+    edge_passes = (
+        ("shadow", shadow_for_edges, props.shadow_line_thickness,
+         props.shadow_line_color, -350, -50),
+        ("hard_shadow", hard_shadow_for_edges, props.hard_shadow_line_thickness,
+         props.hard_shadow_line_color, -700, 50),
+        ("grunge", grunge_white, props.grunge_line_thickness,
+         props.grunge_line_color, -1050, 150),
+    )
+    for key, source, thickness, color, edge_y, line_x in edge_passes:
         edges = tree.nodes.new('CompositorNodeGroup')
         edges.node_tree = edge_group
         edges.name = f"lzla_{key}_edges"
-        edges.location = (-450, -350 if key == "shadow" else -700)
+        edges.location = (-450, edge_y)
         image_in = _group_input_socket(edges, "Image")
         if image_in is not None:
             tree.links.new(source, image_in)
@@ -1019,7 +1097,7 @@ def _build_compositor(context, props):
 
         line_mix, factor, a, b, line_out = _mix_rgba(tree)
         line_mix.name = f"lzla_{key}_line_mix"
-        line_mix.location = (-50 if key == "shadow" else 150, 0)
+        line_mix.location = (line_x, 0)
         b.default_value = tuple(color)
         tree.links.new(edges.outputs["Mask"], factor)
         tree.links.new(current, a)
@@ -1028,7 +1106,7 @@ def _build_compositor(context, props):
         # Same line mix, but stacked over white instead of over the flats.
         split_mix, factor, a, b, split_out = _mix_rgba(tree)
         split_mix.name = f"lzla_split_{key}_line_mix"
-        split_mix.location = (-50 if key == "shadow" else 150, -1050)
+        split_mix.location = (line_x, -1400)
         b.default_value = tuple(color)
         tree.links.new(edges.outputs["Mask"], factor)
         if lines_only is None:
@@ -1046,7 +1124,7 @@ def _build_compositor(context, props):
 
     split_gp_mix, factor, a, b, split_lines_out = _mix_rgba(tree)
     split_gp_mix.name = "lzla_split_lines_gp_mix"
-    split_gp_mix.location = (350, -1050)
+    split_gp_mix.location = (350, -1400)
     tree.links.new(render_layers["lines"].outputs["Alpha"], factor)
     tree.links.new(lines_only, a)
     tree.links.new(render_layers["lines"].outputs["Image"], b)
@@ -1071,7 +1149,7 @@ def _build_compositor(context, props):
 
     final = _lift_from_white_plate(tree, lines_out, alpha, 700, 0)
     lines_final = _lift_from_white_plate(
-        tree, split_lines_out, lines_alpha, 700, -1050, prefix="lzla_lines",
+        tree, split_lines_out, lines_alpha, 700, -1400, prefix="lzla_lines",
     )
     flats_final = _lift_from_white_plate(
         tree, flats_white, render_layers["flat"].outputs["Alpha"], 700, -1700,
@@ -1188,6 +1266,12 @@ def _sync_settings(scene):
         if ramp is not None:
             ramp.color_ramp.elements[1].position = props.shadow_threshold
 
+    hard_shadow_mat = _find_tagged(bpy.data.materials, MAT_OVERRIDE_HARD_SHADOW)
+    if hard_shadow_mat is not None and hard_shadow_mat.node_tree is not None:
+        ramp = hard_shadow_mat.node_tree.nodes.get("lzla_hard_shadow_ramp")
+        if ramp is not None:
+            ramp.color_ramp.elements[1].position = props.hard_shadow_threshold
+
     grunge = _find_tagged(bpy.data.materials, MAT_GRUNGE_MASK)
     if grunge is not None and grunge.node_tree is not None:
         seed = grunge.node_tree.nodes.get("lzla_seed")
@@ -1227,16 +1311,22 @@ def _sync_settings(scene):
 
     comp = _find_tagged(bpy.data.node_groups, NG_COMPOSITOR)
     if comp is not None:
-        shadow_blur = comp.nodes.get("lzla_shadow_blur")
-        if shadow_blur is not None:
-            _set_node_input(shadow_blur, ("Size", "Size_X"), props.shadow_blur)
-            _set_node_input(shadow_blur, "Size_Y", props.shadow_blur)
-        shadow_fill_mask = comp.nodes.get("lzla_shadow_fill_mask")
-        if shadow_fill_mask is not None:
-            shadow_fill_mask.inputs[1].default_value = props.edge_threshold
+        for prefix, blur_radius in (
+            ("lzla_shadow", props.shadow_blur),
+            ("lzla_hard_shadow", props.hard_shadow_blur),
+        ):
+            blur = comp.nodes.get(f"{prefix}_blur")
+            if blur is not None:
+                _set_node_input(blur, ("Size", "Size_X"), blur_radius)
+                _set_node_input(blur, "Size_Y", blur_radius)
+            fill_mask = comp.nodes.get(f"{prefix}_fill_mask")
+            if fill_mask is not None:
+                fill_mask.inputs[1].default_value = props.edge_threshold
         for key, tint_color, line_thickness, line_color in (
             ("shadow", props.shadow_color, props.shadow_line_thickness,
              props.shadow_line_color),
+            ("hard_shadow", props.hard_shadow_color, props.hard_shadow_line_thickness,
+             props.hard_shadow_line_color),
             ("grunge", props.grunge_color, props.grunge_line_thickness,
              props.grunge_line_color),
         ):
@@ -1638,6 +1728,35 @@ class LazyLineartProps(PropertyGroup):
         description="Color of the shadow contour lines",
         update=_on_setting_changed,
     )
+    hard_shadow_threshold: FloatProperty(
+        name="Hard Shadow Threshold", default=0.12, min=0.001, max=1.0,
+        description="Diffuse light level below which the hard-shadow pass counts as "
+                    "extreme dark before compositor blur and hardening at Edge Threshold",
+        update=_on_setting_changed,
+    )
+    hard_shadow_blur: FloatProperty(
+        name="Hard Shadow Blur", default=1.0, min=0.0, max=32.0, subtype='PIXEL',
+        description="Pixel blur applied to the hard-shadow pass before the hard Edge "
+                    "Threshold cut (fill and contour lines share this boundary)",
+        update=_on_setting_changed,
+    )
+    hard_shadow_color: FloatVectorProperty(
+        name="Hard Shadow Color", subtype='COLOR', size=4,
+        default=(0.22, 0.22, 0.28, 1.0), min=0.0, max=1.0,
+        description="Tint multiplied onto the flat colors inside extreme dark regions",
+        update=_on_setting_changed,
+    )
+    hard_shadow_line_thickness: FloatProperty(
+        name="Hard Shadow Line Width", default=4.0, min=1.0, max=32.0, subtype='PIXEL',
+        description="Thickness of the hard-shadow contour lines, in pixels",
+        update=_on_setting_changed,
+    )
+    hard_shadow_line_color: FloatVectorProperty(
+        name="Hard Shadow Line Color", subtype='COLOR', size=4,
+        default=(0.0, 0.0, 0.0, 1.0), min=0.0, max=1.0,
+        description="Color of the hard-shadow contour lines",
+        update=_on_setting_changed,
+    )
     grunge_color: FloatVectorProperty(
         name="Grunge Color", subtype='COLOR', size=4,
         default=(0.8, 0.78, 0.72, 1.0), min=0.0, max=1.0,
@@ -1705,8 +1824,8 @@ class LazyLineartProps(PropertyGroup):
     )
     edge_threshold: FloatProperty(
         name="Edge Threshold", default=0.5, min=0.0, max=1.0,
-        description="Luminance cut for shadow fill hardening and contour detection on "
-                    "the shadow/grunge passes",
+        description="Luminance cut for shadow/hard-shadow fill hardening and contour "
+                    "detection on the shadow/grunge passes",
         update=_on_setting_changed,
     )
     bake_strokes: BoolProperty(
@@ -1768,6 +1887,15 @@ class LINEART_PT_lazy_panel(Panel):
         col.prop(props, "shadow_color")
         col.prop(props, "shadow_line_thickness")
         col.prop(props, "shadow_line_color")
+
+        layout.separator()
+        layout.label(text="Hard Shadow Pass:")
+        col = layout.column(align=True)
+        col.prop(props, "hard_shadow_threshold")
+        col.prop(props, "hard_shadow_blur")
+        col.prop(props, "hard_shadow_color")
+        col.prop(props, "hard_shadow_line_thickness")
+        col.prop(props, "hard_shadow_line_color")
 
         layout.separator()
         layout.label(text="Grunge Pass:")
