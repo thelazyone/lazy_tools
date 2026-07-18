@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 0),
+    "version": (0, 1, 7),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -803,7 +803,10 @@ def _build_edge_detect_group(props):
 
 
 def _over_white(tree, rl_node, x, y, name):
-    """Composite a transparent-film render layer onto a flat white backdrop."""
+    """Composite a transparent-film render layer onto a flat white backdrop.
+
+    Needed for fill/edge maths (ramps and mixes treat missing film as white).
+    Final transparency is applied afterward via a combined alpha mask."""
     node, factor, a, b, result = _mix_rgba(tree)
     node.name = name
     node.location = (x, y)
@@ -811,6 +814,87 @@ def _over_white(tree, rl_node, x, y, name):
     tree.links.new(rl_node.outputs["Alpha"], factor)
     tree.links.new(rl_node.outputs["Image"], b)
     return result
+
+
+def _math_maximum(tree, socket_a, socket_b, x, y, name):
+    node = tree.nodes.new('ShaderNodeMath')
+    node.name = name
+    node.operation = 'MAXIMUM'
+    node.location = (x, y)
+    tree.links.new(socket_a, node.inputs[0])
+    tree.links.new(socket_b, node.inputs[1])
+    return node.outputs[0]
+
+
+def _lift_from_white_plate(tree, beauty, alpha, x, y):
+    """Undo 'composite over white' using a soft coverage alpha.
+
+    beauty = fg * a + white * (1 - a)  →  fg = (beauty - white * (1 - a)) / a
+    Without this, Set Alpha alone leaves a white halo in AA'd line edges.
+    """
+    inv_a = tree.nodes.new('ShaderNodeMath')
+    inv_a.name = "lzla_alpha_inv"
+    inv_a.operation = 'SUBTRACT'
+    inv_a.location = (x - 400, y - 120)
+    inv_a.inputs[0].default_value = 1.0
+    tree.links.new(alpha, inv_a.inputs[1])
+
+    # white * (1 - a) as an RGB color
+    white_part, factor, a_in, b_in, white_rgb = _mix_rgba(tree)
+    white_part.name = "lzla_white_part"
+    white_part.location = (x - 220, y - 120)
+    a_in.default_value = (0.0, 0.0, 0.0, 1.0)
+    b_in.default_value = (1.0, 1.0, 1.0, 1.0)
+    tree.links.new(inv_a.outputs[0], factor)
+
+    associated, factor, a_in, b_in, associated_rgb = _mix_rgba(tree, 'SUBTRACT')
+    associated.name = "lzla_lift_subtract"
+    associated.location = (x - 40, y)
+    factor.default_value = 1.0
+    tree.links.new(beauty, a_in)
+    tree.links.new(white_rgb, b_in)
+
+    safe_a = tree.nodes.new('ShaderNodeMath')
+    safe_a.name = "lzla_alpha_safe"
+    safe_a.operation = 'MAXIMUM'
+    safe_a.location = (x - 400, y - 280)
+    tree.links.new(alpha, safe_a.inputs[0])
+    safe_a.inputs[1].default_value = 1e-4
+
+    # 1 / safe_a, broadcast to RGB, multiply → straight color
+    inv_safe = tree.nodes.new('ShaderNodeMath')
+    inv_safe.name = "lzla_alpha_rcp"
+    inv_safe.operation = 'DIVIDE'
+    inv_safe.location = (x - 220, y - 280)
+    inv_safe.inputs[0].default_value = 1.0
+    tree.links.new(safe_a.outputs[0], inv_safe.inputs[1])
+
+    scale, factor, a_in, b_in, scale_rgb = _mix_rgba(tree)
+    scale.name = "lzla_alpha_scale_rgb"
+    scale.location = (x - 40, y - 280)
+    a_in.default_value = (0.0, 0.0, 0.0, 1.0)
+    b_in.default_value = (1.0, 1.0, 1.0, 1.0)
+    tree.links.new(inv_safe.outputs[0], factor)
+
+    straight, factor, a_in, b_in, straight_rgb = _mix_rgba(tree, 'MULTIPLY')
+    straight.name = "lzla_lift_straight"
+    straight.location = (x + 160, y)
+    factor.default_value = 1.0
+    tree.links.new(associated_rgb, a_in)
+    tree.links.new(scale_rgb, b_in)
+
+    set_alpha = tree.nodes.new('CompositorNodeSetAlpha')
+    set_alpha.name = "lzla_set_alpha"
+    set_alpha.location = (x + 360, y)
+    if hasattr(set_alpha, "mode"):
+        set_alpha.mode = 'REPLACE_ALPHA'
+    else:
+        _set_node_input(set_alpha, ("Type", "Mode"), 'REPLACE_ALPHA')
+    image_in = set_alpha.inputs.get("Image") or set_alpha.inputs[0]
+    alpha_in = set_alpha.inputs.get("Alpha") or set_alpha.inputs[1]
+    tree.links.new(straight_rgb, image_in)
+    tree.links.new(alpha, alpha_in)
+    return set_alpha.outputs.get("Image") or set_alpha.outputs[0]
 
 
 def _shadow_hard_mask(tree, shadow_white, edge_threshold, blur_radius, x, y):
@@ -867,6 +951,8 @@ def _build_compositor(context, props):
         node.location = (-1100, -350 * row)
         render_layers[key] = node
 
+    # Beauty is still built over white (ramps/mixes need that). Transparency is
+    # restored at the end with max(flat alpha, GP alpha, edge-line masks).
     flat_white = _over_white(tree, render_layers["flat"], -700, 0, "lzla_flat_over_white")
     shadow_white = _over_white(tree, render_layers["shadow"], -700, -350, "lzla_shadow_over_white")
     grunge_white = _over_white(tree, render_layers["grunge"], -700, -700, "lzla_grunge_over_white")
@@ -874,9 +960,6 @@ def _build_compositor(context, props):
         tree, shadow_white, props.edge_threshold, props.shadow_blur, -500, -350,
     )
 
-    # Shadow/grunge passes are remapped to tint colors and multiplied onto the
-    # flat pass. Shadow uses a blurred-then-hard-stepped mask at Edge Threshold
-    # for both fill and contour lines (same logic as grunge).
     current = flat_white
 
     shadow_tint, factor, a, b, shadow_tint_out = _mix_rgba(tree)
@@ -909,6 +992,7 @@ def _build_compositor(context, props):
     tree.links.new(grunge_tint_out, b)
     current = grunge_multiply_out
 
+    edge_masks = []
     for key, source, thickness, color in (
         ("shadow", shadow_for_edges, props.shadow_line_thickness, props.shadow_line_color),
         ("grunge", grunge_white, props.grunge_line_thickness, props.grunge_line_color),
@@ -922,6 +1006,7 @@ def _build_compositor(context, props):
             tree.links.new(source, image_in)
         _set_group_input(edges, "Threshold", props.edge_threshold)
         _set_group_input(edges, "Thickness", thickness)
+        edge_masks.append(edges.outputs["Mask"])
 
         line_mix, factor, a, b, line_out = _mix_rgba(tree)
         line_mix.name = f"lzla_{key}_line_mix"
@@ -938,13 +1023,26 @@ def _build_compositor(context, props):
     tree.links.new(current, a)
     tree.links.new(render_layers["lines"].outputs["Image"], b)
 
+    # Combined coverage: mesh fill + GP strokes + morph edge bleed outside.
+    alpha = render_layers["flat"].outputs["Alpha"]
+    alpha = _math_maximum(
+        tree, alpha, render_layers["lines"].outputs["Alpha"],
+        350, -200, "lzla_alpha_flat_lines",
+    )
+    for i, mask in enumerate(edge_masks):
+        alpha = _math_maximum(
+            tree, alpha, mask, 350, -280 - 80 * i, f"lzla_alpha_edge_{i}",
+        )
+
+    final = _lift_from_white_plate(tree, lines_out, alpha, 700, 0)
+
     group_out = tree.nodes.new('NodeGroupOutput')
-    group_out.location = (600, 0)
-    tree.links.new(lines_out, group_out.inputs["Image"])
+    group_out.location = (1100, 0)
+    tree.links.new(final, group_out.inputs["Image"])
 
     viewer = tree.nodes.new('CompositorNodeViewer')
-    viewer.location = (600, -200)
-    tree.links.new(lines_out, viewer.inputs["Image"])
+    viewer.location = (1100, -200)
+    tree.links.new(final, viewer.inputs["Image"])
 
     scene.compositing_node_group = tree
     scene.render.use_compositing = True
