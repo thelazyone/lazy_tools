@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 7),
+    "version": (0, 1, 8),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -14,6 +14,7 @@ bl_info = {
 import math
 import time
 import traceback
+from datetime import datetime
 
 import bpy
 from bpy.types import Operator, Panel, PropertyGroup
@@ -40,6 +41,7 @@ WORLD_DARK = f"{TAG}.world.dark"
 NG_STROKE_FILTER = f"{TAG}.ng.stroke_filter"
 NG_EDGE_DETECT = f"{TAG}.ng.edge_detect"
 NG_COMPOSITOR = f"{TAG}.ng.compositor"
+FILE_OUT_NAME = "lzla_file_out"
 
 GP_LAYER_NAME = "Lines"
 LINEART_MOD_NAME = f"{TAG} Line Art"
@@ -1044,10 +1046,50 @@ def _build_compositor(context, props):
     viewer.location = (1100, -200)
     tree.links.new(final, viewer.inputs["Image"])
 
+    # Same image the Viewer sees — File Output writes it when you render.
+    file_out = tree.nodes.new('CompositorNodeOutputFile')
+    file_out.name = FILE_OUT_NAME
+    file_out.label = "Lazy Line Art PNG"
+    file_out.location = (1100, 200)
+    file_out.directory = "//"
+    file_out.file_name = "lazy_lineart"
+    while len(file_out.file_output_items) > 0:
+        file_out.file_output_items.remove(file_out.file_output_items[0])
+    slot_index = len(file_out.outputs)
+    file_out.file_output_items.new('RGBA', "Image")
+    tree.links.new(final, file_out.inputs[slot_index])
+    fmt = file_out.format
+    if hasattr(fmt, "media_type"):
+        fmt.media_type = 'IMAGE'
+    fmt.file_format = 'PNG'
+    fmt.color_mode = 'RGBA'
+
     scene.compositing_node_group = tree
     scene.render.use_compositing = True
     scene.render.film_transparent = True
     return tree
+
+
+def _arm_file_output(scene):
+    """Put a fresh timestamped path on the File Output node (next to the .blend)."""
+    if not bpy.data.is_saved:
+        return None, "Save the .blend first"
+    comp = scene.compositing_node_group
+    if comp is None or comp.get(ID_PROP) != NG_COMPOSITOR:
+        return None, "Run Build Pipeline first"
+    node = comp.nodes.get(FILE_OUT_NAME)
+    if node is None:
+        return None, "File Output missing - run Build Pipeline"
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    node.directory = "//"
+    node.file_name = f"lazy_lineart_{stamp}"
+    fmt = node.format
+    if hasattr(fmt, "media_type"):
+        fmt.media_type = 'IMAGE'
+    fmt.file_format = 'PNG'
+    fmt.color_mode = 'RGBA'
+    return node.file_name, None
 
 
 # ----------------------------------------------------------------------------
@@ -1437,16 +1479,20 @@ class LINEART_OT_generate(Operator):
 class LINEART_OT_render_composite(Operator):
     bl_idname = "lazylineart.render_composite"
     bl_label = "Render Composite"
-    bl_description = "Render all view layers and combine them through the prepared compositor"
+    bl_description = (
+        "Render all view layers, combine through the compositor, and write a "
+        "timestamped PNG next to the .blend via File Output"
+    )
 
     def execute(self, context):
         scene = context.scene
-        if scene.compositing_node_group is None or \
-                scene.compositing_node_group.get(ID_PROP) != NG_COMPOSITOR:
-            self.report({'WARNING'}, "The Lazy Line Art compositor tree isn't active - "
-                                     "run Build Pipeline first")
+        file_name, err = _arm_file_output(scene)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
         scene.render.use_compositing = True
         bpy.ops.render.render('INVOKE_DEFAULT')
+        self.report({'INFO'}, f"File Output → //{file_name}Image####.png")
         return {'FINISHED'}
 
 
