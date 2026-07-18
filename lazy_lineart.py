@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 13),
+    "version": (0, 1, 19),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -172,6 +172,49 @@ def _mix_rgba(tree, blend_type='MIX'):
     return node, factor, a, b, result
 
 
+def _link_toon_luminance_step(tree, luminance, threshold_name, threshold_value, x, y=0):
+    """Hard-step luminance to black (shadow) / white (lit) at threshold."""
+    value = tree.nodes.new('ShaderNodeValue')
+    value.name = threshold_name
+    value.location = (x, y - 140)
+    value.outputs[0].default_value = threshold_value
+
+    compare = tree.nodes.new('ShaderNodeMath')
+    compare.name = f"{threshold_name}_compare"
+    compare.operation = 'GREATER_THAN'
+    compare.location = (x, y)
+    tree.links.new(luminance, compare.inputs[0])
+    tree.links.new(value.outputs[0], compare.inputs[1])
+
+    mix, factor, a, b, result = _mix_rgba(tree)
+    mix.name = f"{threshold_name}_mix"
+    mix.location = (x + 180, y)
+    a.default_value = (0.0, 0.0, 0.0, 1.0)
+    b.default_value = (1.0, 1.0, 1.0, 1.0)
+    tree.links.new(compare.outputs[0], factor)
+    return result
+
+
+def _set_material_threshold(mat, value_node_name, ramp_name, value):
+    """Write a threshold slider value into an override material node tree."""
+    if mat is None or mat.node_tree is None:
+        return False
+    value_node = mat.node_tree.nodes.get(value_node_name)
+    if value_node is not None:
+        if value_node.type == 'VALUE':
+            value_node.outputs[0].default_value = value
+        elif value_node.type == 'MATH':
+            value_node.inputs[1].default_value = value
+        mat.update_tag()
+        return True
+    ramp = mat.node_tree.nodes.get(ramp_name)
+    if ramp is not None:
+        ramp.color_ramp.elements[1].position = value
+        mat.update_tag()
+        return True
+    return False
+
+
 def _clear_node_tree(tree):
     tree.nodes.clear()
     interface = getattr(tree, "interface", None)
@@ -193,13 +236,11 @@ def _ensure_material(key):
     return mat
 
 
-def _build_override_white(props):
-    """Toon-stepped matte white for the shadow view layer override.
+def _build_override_shadow(props):
+    """Toon-stepped matte white for the normal shadow view layer.
 
-    Diffuse lighting is converted to luminance and hard-stepped at
-    Shadow Threshold. The compositor blurs that pass, hard-steps again at
-    Edge Threshold, and uses the result for both shadow fill and contours
-    (same logic as the grunge pass)."""
+    Diffuse lighting is hard-stepped at Shadow Threshold. The compositor blurs
+    that pass, hard-steps again at Edge Threshold, and tints flats darker."""
     mat = _ensure_material(MAT_OVERRIDE_WHITE)
     tree = mat.node_tree
     tree.nodes.clear()
@@ -216,19 +257,13 @@ def _build_override_white(props):
     to_bw.location = (-150, 0)
     tree.links.new(to_rgb.outputs["Color"], to_bw.inputs["Color"])
 
-    ramp = tree.nodes.new('ShaderNodeValToRGB')
-    ramp.name = "lzla_shadow_ramp"
-    ramp.location = (50, 0)
-    ramp.color_ramp.interpolation = 'CONSTANT'
-    ramp.color_ramp.elements[0].position = 0.0
-    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
-    ramp.color_ramp.elements[1].position = props.shadow_threshold
-    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
-    tree.links.new(to_bw.outputs["Val"], ramp.inputs["Fac"])
+    mask = _link_toon_luminance_step(
+        tree, to_bw.outputs["Val"], "lzla_shadow_threshold", props.shadow_threshold, 50,
+    )
 
     emission = tree.nodes.new('ShaderNodeEmission')
     emission.location = (300, 0)
-    tree.links.new(ramp.outputs["Color"], emission.inputs["Color"])
+    tree.links.new(mask, emission.inputs["Color"])
 
     output = tree.nodes.new('ShaderNodeOutputMaterial')
     output.location = (550, 0)
@@ -237,12 +272,10 @@ def _build_override_white(props):
 
 
 def _build_override_hard_shadow(props):
-    """Toon-stepped matte white for the hard-shadow view layer override.
+    """Toon-stepped matte white for the hard-shadow view layer.
 
-    Same diffuse-to-luminance pipeline as the regular shadow pass, but stepped
-    at Hard Shadow Threshold so only the darkest lit regions register. The
-    compositor blurs that pass, hard-steps again at Edge Threshold, and uses
-    the result for fill tinting and contour lines."""
+    Same pipeline as the normal shadow pass, but stepped at Hard Shadow
+    Threshold so only the deepest lit regions register before compositing."""
     mat = _ensure_material(MAT_OVERRIDE_HARD_SHADOW)
     tree = mat.node_tree
     tree.nodes.clear()
@@ -259,22 +292,29 @@ def _build_override_hard_shadow(props):
     to_bw.location = (-150, 0)
     tree.links.new(to_rgb.outputs["Color"], to_bw.inputs["Color"])
 
-    ramp = tree.nodes.new('ShaderNodeValToRGB')
-    ramp.name = "lzla_hard_shadow_ramp"
-    ramp.location = (50, 0)
-    ramp.color_ramp.interpolation = 'CONSTANT'
-    ramp.color_ramp.elements[0].position = 0.0
-    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
-    ramp.color_ramp.elements[1].position = props.hard_shadow_threshold
-    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
-    tree.links.new(to_bw.outputs["Val"], ramp.inputs["Fac"])
+    mask = _link_toon_luminance_step(
+        tree, to_bw.outputs["Val"], "lzla_hard_shadow_threshold",
+        props.hard_shadow_threshold, 50,
+    )
+
+    enable = tree.nodes.new('ShaderNodeValue')
+    enable.name = "lzla_hard_shadow_enabled"
+    enable.location = (50, -140)
+    enable.outputs[0].default_value = 1.0 if props.hard_shadow_enabled else 0.0
+
+    enable_mix, factor, a, b, emission_color = _mix_rgba(tree)
+    enable_mix.name = "lzla_hard_shadow_enable_mix"
+    enable_mix.location = (250, 0)
+    a.default_value = (1.0, 1.0, 1.0, 1.0)
+    tree.links.new(mask, b)
+    tree.links.new(enable.outputs[0], factor)
 
     emission = tree.nodes.new('ShaderNodeEmission')
-    emission.location = (300, 0)
-    tree.links.new(ramp.outputs["Color"], emission.inputs["Color"])
+    emission.location = (450, 0)
+    tree.links.new(emission_color, emission.inputs["Color"])
 
     output = tree.nodes.new('ShaderNodeOutputMaterial')
-    output.location = (550, 0)
+    output.location = (650, 0)
     tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
     return mat
 
@@ -722,7 +762,7 @@ def _ensure_view_layer(scene, name):
 
 def _configure_view_layers(context, lineart_collection, props):
     scene = context.scene
-    override_white = _build_override_white(props)
+    override_shadow = _build_override_shadow(props)
     override_hard_shadow = _build_override_hard_shadow(props)
     grunge_mask = _build_grunge_mask(props)
     dark_world = _build_dark_world()
@@ -750,7 +790,7 @@ def _configure_view_layers(context, lineart_collection, props):
         child.holdout = not is_lineart
 
     vl_flat.material_override = None
-    vl_shadow.material_override = override_white
+    vl_shadow.material_override = override_shadow
     vl_shadow.world_override = dark_world
     vl_hard_shadow.material_override = override_hard_shadow
     vl_hard_shadow.world_override = dark_world
@@ -877,6 +917,42 @@ def _math_maximum(tree, socket_a, socket_b, x, y, name):
     tree.links.new(socket_a, node.inputs[0])
     tree.links.new(socket_b, node.inputs[1])
     return node.outputs[0]
+
+
+def _gate_mask(tree, mask, enable_socket, x, y, name):
+    """Zero a mask when enable is off (for contour lines)."""
+    gate = tree.nodes.new('ShaderNodeMath')
+    gate.name = name
+    gate.operation = 'MULTIPLY'
+    gate.location = (x, y)
+    tree.links.new(mask, gate.inputs[0])
+    tree.links.new(enable_socket, gate.inputs[1])
+    return gate.outputs[0]
+
+
+def _mask_passthrough_when_off(tree, mask, enable_socket, x, y, name_prefix):
+    """When enable is off, output 1 so the tint mix passes through unchanged."""
+    inv_enable = tree.nodes.new('ShaderNodeMath')
+    inv_enable.name = f"{name_prefix}_inv_enable"
+    inv_enable.operation = 'SUBTRACT'
+    inv_enable.location = (x - 120, y)
+    inv_enable.inputs[0].default_value = 1.0
+    tree.links.new(enable_socket, inv_enable.inputs[1])
+
+    scaled = tree.nodes.new('ShaderNodeMath')
+    scaled.name = f"{name_prefix}_scaled"
+    scaled.operation = 'MULTIPLY'
+    scaled.location = (x - 40, y)
+    tree.links.new(mask, scaled.inputs[0])
+    tree.links.new(enable_socket, scaled.inputs[1])
+
+    result = tree.nodes.new('ShaderNodeMath')
+    result.name = f"{name_prefix}_passthrough"
+    result.operation = 'ADD'
+    result.location = (x, y)
+    tree.links.new(scaled.outputs[0], result.inputs[0])
+    tree.links.new(inv_enable.outputs[0], result.inputs[1])
+    return result.outputs[0]
 
 
 def _lift_from_white_plate(tree, beauty, alpha, x, y, prefix="lzla"):
@@ -1022,6 +1098,11 @@ def _build_compositor(context, props):
         -500, -700, prefix="lzla_hard_shadow",
     )
 
+    hard_shadow_enable = tree.nodes.new('ShaderNodeValue')
+    hard_shadow_enable.name = "lzla_hard_shadow_enable"
+    hard_shadow_enable.location = (-500, -850)
+    hard_shadow_enable.outputs[0].default_value = 1.0 if props.hard_shadow_enabled else 0.0
+
     current = flat_white
 
     shadow_tint, factor, a, b, shadow_tint_out = _mix_rgba(tree)
@@ -1044,7 +1125,11 @@ def _build_compositor(context, props):
     hard_shadow_tint.location = (-250, -700)
     a.default_value = tuple(props.hard_shadow_color)
     b.default_value = (1.0, 1.0, 1.0, 1.0)
-    tree.links.new(hard_shadow_hard, factor)
+    hard_shadow_mask = _mask_passthrough_when_off(
+        tree, hard_shadow_hard, hard_shadow_enable.outputs[0],
+        -350, -700, "lzla_hard_shadow_fill",
+    )
+    tree.links.new(hard_shadow_mask, factor)
 
     hard_shadow_multiply, factor, a, b, hard_shadow_multiply_out = _mix_rgba(tree, 'MULTIPLY')
     hard_shadow_multiply.name = "lzla_hard_shadow_multiply"
@@ -1093,13 +1178,19 @@ def _build_compositor(context, props):
             tree.links.new(source, image_in)
         _set_group_input(edges, "Threshold", props.edge_threshold)
         _set_group_input(edges, "Thickness", thickness)
-        edge_masks.append(edges.outputs["Mask"])
+        edge_mask = edges.outputs["Mask"]
+        if key == "hard_shadow":
+            edge_mask = _gate_mask(
+                tree, edge_mask, hard_shadow_enable.outputs[0],
+                -300, edge_y, "lzla_hard_shadow_edge_gate",
+            )
+        edge_masks.append(edge_mask)
 
         line_mix, factor, a, b, line_out = _mix_rgba(tree)
         line_mix.name = f"lzla_{key}_line_mix"
         line_mix.location = (line_x, 0)
         b.default_value = tuple(color)
-        tree.links.new(edges.outputs["Mask"], factor)
+        tree.links.new(edge_mask, factor)
         tree.links.new(current, a)
         current = line_out
 
@@ -1108,7 +1199,7 @@ def _build_compositor(context, props):
         split_mix.name = f"lzla_split_{key}_line_mix"
         split_mix.location = (line_x, -1400)
         b.default_value = tuple(color)
-        tree.links.new(edges.outputs["Mask"], factor)
+        tree.links.new(edge_mask, factor)
         if lines_only is None:
             a.default_value = (1.0, 1.0, 1.0, 1.0)
         else:
@@ -1239,6 +1330,86 @@ def _arm_file_output(scene, split=False):
 # Settings sync (panel props -> existing datablocks, no creation)
 # ----------------------------------------------------------------------------
 
+def _sync_shadow_thresholds(scene):
+    """Push shadow threshold sliders into the override material node trees."""
+    props = scene.lazy_lineart_props
+
+    shadow_mat = _find_tagged(bpy.data.materials, MAT_OVERRIDE_WHITE)
+    if shadow_mat is None and scene.view_layers.get(VL_SHADOW) is not None:
+        shadow_mat = _build_override_shadow(props)
+
+    vl_shadow = scene.view_layers.get(VL_SHADOW)
+    if vl_shadow is not None and shadow_mat is not None:
+        if vl_shadow.material_override != shadow_mat:
+            vl_shadow.material_override = shadow_mat
+
+    mat = shadow_mat
+    if vl_shadow is not None and vl_shadow.material_override is not None:
+        mat = vl_shadow.material_override
+
+    _set_material_threshold(
+        mat, "lzla_shadow_threshold", "lzla_shadow_ramp", props.shadow_threshold,
+    )
+
+    hard_shadow_mat = _find_tagged(bpy.data.materials, MAT_OVERRIDE_HARD_SHADOW)
+    if hard_shadow_mat is None and scene.view_layers.get(VL_HARD_SHADOW) is not None:
+        hard_shadow_mat = _build_override_hard_shadow(props)
+
+    vl_hard_shadow = scene.view_layers.get(VL_HARD_SHADOW)
+    if vl_hard_shadow is not None and hard_shadow_mat is not None:
+        if vl_hard_shadow.material_override != hard_shadow_mat:
+            vl_hard_shadow.material_override = hard_shadow_mat
+
+    hard_mat = hard_shadow_mat
+    if vl_hard_shadow is not None and vl_hard_shadow.material_override is not None:
+        hard_mat = vl_hard_shadow.material_override
+
+    _set_material_threshold(
+        hard_mat, "lzla_hard_shadow_threshold", "lzla_hard_shadow_ramp",
+        props.hard_shadow_threshold,
+    )
+
+
+def _sync_hard_shadow_enabled(scene):
+    """Push the enable checkbox into the hard-shadow material and compositor."""
+    props = scene.lazy_lineart_props
+    enabled_val = 1.0 if props.hard_shadow_enabled else 0.0
+
+    hard_shadow_mat = _find_tagged(bpy.data.materials, MAT_OVERRIDE_HARD_SHADOW)
+    if hard_shadow_mat is None and scene.view_layers.get(VL_HARD_SHADOW) is not None:
+        hard_shadow_mat = _build_override_hard_shadow(props)
+
+    vl_hard_shadow = scene.view_layers.get(VL_HARD_SHADOW)
+    if vl_hard_shadow is not None and hard_shadow_mat is not None:
+        if vl_hard_shadow.material_override != hard_shadow_mat:
+            vl_hard_shadow.material_override = hard_shadow_mat
+
+    hard_mat = hard_shadow_mat
+    if vl_hard_shadow is not None and vl_hard_shadow.material_override is not None:
+        hard_mat = vl_hard_shadow.material_override
+
+    if hard_mat is not None and hard_mat.node_tree is not None:
+        enable = hard_mat.node_tree.nodes.get("lzla_hard_shadow_enabled")
+        if enable is None:
+            hard_mat = _build_override_hard_shadow(props)
+            if vl_hard_shadow is not None:
+                vl_hard_shadow.material_override = hard_mat
+            _set_material_threshold(
+                hard_mat, "lzla_hard_shadow_threshold", "lzla_hard_shadow_ramp",
+                props.hard_shadow_threshold,
+            )
+            enable = hard_mat.node_tree.nodes.get("lzla_hard_shadow_enabled")
+        if enable is not None:
+            enable.outputs[0].default_value = enabled_val
+            hard_mat.update_tag()
+
+    comp = _find_tagged(bpy.data.node_groups, NG_COMPOSITOR)
+    if comp is not None:
+        enable_node = comp.nodes.get("lzla_hard_shadow_enable")
+        if enable_node is not None:
+            enable_node.outputs[0].default_value = enabled_val
+
+
 def _sync_settings(scene):
     props = scene.lazy_lineart_props
 
@@ -1260,17 +1431,8 @@ def _sync_settings(scene):
     if line_material is not None and line_material.is_grease_pencil:
         line_material.grease_pencil.color = tuple(props.line_color)
 
-    shadow_mat = _find_tagged(bpy.data.materials, MAT_OVERRIDE_WHITE)
-    if shadow_mat is not None and shadow_mat.node_tree is not None:
-        ramp = shadow_mat.node_tree.nodes.get("lzla_shadow_ramp")
-        if ramp is not None:
-            ramp.color_ramp.elements[1].position = props.shadow_threshold
-
-    hard_shadow_mat = _find_tagged(bpy.data.materials, MAT_OVERRIDE_HARD_SHADOW)
-    if hard_shadow_mat is not None and hard_shadow_mat.node_tree is not None:
-        ramp = hard_shadow_mat.node_tree.nodes.get("lzla_hard_shadow_ramp")
-        if ramp is not None:
-            ramp.color_ramp.elements[1].position = props.hard_shadow_threshold
+    _sync_shadow_thresholds(scene)
+    _sync_hard_shadow_enabled(scene)
 
     grunge = _find_tagged(bpy.data.materials, MAT_GRUNGE_MASK)
     if grunge is not None and grunge.node_tree is not None:
@@ -1458,6 +1620,24 @@ def _on_setting_changed(self, context):
         bpy.app.timers.register(_run_sync_timer, first_interval=0.05)
 
 
+def _on_shadow_threshold_changed(self, context):
+    if context is None:
+        return
+    _sync_shadow_thresholds(context.scene)
+
+
+def _on_hard_shadow_threshold_changed(self, context):
+    if context is None:
+        return
+    _sync_shadow_thresholds(context.scene)
+
+
+def _on_hard_shadow_enabled_changed(self, context):
+    if context is None:
+        return
+    _sync_hard_shadow_enabled(context.scene)
+
+
 def _is_external_update(depsgraph):
     """True if this depsgraph event contains a change Line Art would recompute
     for: anything except our own tagged datablocks, and except data that can't
@@ -1641,6 +1821,7 @@ class LINEART_OT_render_composite(Operator):
 
     def execute(self, context):
         scene = context.scene
+        _sync_settings(scene)
         file_name, err = _arm_file_output(scene)
         if err:
             self.report({'ERROR'}, err)
@@ -1662,6 +1843,7 @@ class LINEART_OT_render_split(Operator):
 
     def execute(self, context):
         scene = context.scene
+        _sync_settings(scene)
         file_name, err = _arm_file_output(scene, split=True)
         if err:
             self.report({'ERROR'}, err)
@@ -1701,20 +1883,20 @@ class LazyLineartProps(PropertyGroup):
     )
     shadow_threshold: FloatProperty(
         name="Shadow Threshold", default=0.35, min=0.001, max=1.0,
-        description="Diffuse light level below which the shadow pass counts as toon "
-                    "shadow before compositor blur and hardening at Edge Threshold",
-        update=_on_setting_changed,
+        description="Diffuse light level below which the normal shadow pass darkens "
+                    "flats before compositor blur and hardening at Edge Threshold",
+        update=_on_shadow_threshold_changed,
     )
     shadow_blur: FloatProperty(
         name="Shadow Blur", default=2.0, min=0.0, max=32.0, subtype='PIXEL',
-        description="Pixel blur applied to the shadow pass before the hard Edge "
+        description="Pixel blur applied to the normal shadow pass before the hard Edge "
                     "Threshold cut (fill and contour lines share this boundary)",
         update=_on_setting_changed,
     )
     shadow_color: FloatVectorProperty(
         name="Shadow Color", subtype='COLOR', size=4,
         default=(0.55, 0.55, 0.62, 1.0), min=0.0, max=1.0,
-        description="Tint multiplied onto the flat colors inside toon shadow regions",
+        description="Tint multiplied onto flat colors in shaded regions (darkens)",
         update=_on_setting_changed,
     )
     shadow_line_thickness: FloatProperty(
@@ -1728,11 +1910,16 @@ class LazyLineartProps(PropertyGroup):
         description="Color of the shadow contour lines",
         update=_on_setting_changed,
     )
+    hard_shadow_enabled: BoolProperty(
+        name="Enable Hard Shadow", default=True,
+        description="Apply the hard-shadow tint and contour pass on top of normal shadow",
+        update=_on_hard_shadow_enabled_changed,
+    )
     hard_shadow_threshold: FloatProperty(
         name="Hard Shadow Threshold", default=0.12, min=0.001, max=1.0,
-        description="Diffuse light level below which the hard-shadow pass counts as "
-                    "extreme dark before compositor blur and hardening at Edge Threshold",
-        update=_on_setting_changed,
+        description="Diffuse light level below which the hard-shadow pass pushes flats "
+                    "to black before compositor blur and hardening at Edge Threshold",
+        update=_on_hard_shadow_threshold_changed,
     )
     hard_shadow_blur: FloatProperty(
         name="Hard Shadow Blur", default=1.0, min=0.0, max=32.0, subtype='PIXEL',
@@ -1742,8 +1929,8 @@ class LazyLineartProps(PropertyGroup):
     )
     hard_shadow_color: FloatVectorProperty(
         name="Hard Shadow Color", subtype='COLOR', size=4,
-        default=(0.22, 0.22, 0.28, 1.0), min=0.0, max=1.0,
-        description="Tint multiplied onto the flat colors inside extreme dark regions",
+        default=(0.0, 0.0, 0.0, 1.0), min=0.0, max=1.0,
+        description="Tint multiplied onto flat colors in the deepest shadow (black)",
         update=_on_setting_changed,
     )
     hard_shadow_line_thickness: FloatProperty(
@@ -1891,11 +2078,14 @@ class LINEART_PT_lazy_panel(Panel):
         layout.separator()
         layout.label(text="Hard Shadow Pass:")
         col = layout.column(align=True)
-        col.prop(props, "hard_shadow_threshold")
-        col.prop(props, "hard_shadow_blur")
-        col.prop(props, "hard_shadow_color")
-        col.prop(props, "hard_shadow_line_thickness")
-        col.prop(props, "hard_shadow_line_color")
+        col.prop(props, "hard_shadow_enabled")
+        sub = col.column(align=True)
+        sub.enabled = props.hard_shadow_enabled
+        sub.prop(props, "hard_shadow_threshold")
+        sub.prop(props, "hard_shadow_blur")
+        sub.prop(props, "hard_shadow_color")
+        sub.prop(props, "hard_shadow_line_thickness")
+        sub.prop(props, "hard_shadow_line_color")
 
         layout.separator()
         layout.label(text="Grunge Pass:")
