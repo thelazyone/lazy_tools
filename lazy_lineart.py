@@ -1694,7 +1694,8 @@ def _sync_settings(scene):
                 if item.item_type == 'SOCKET' and item.name == "Min Length":
                     stroke_filter[item.identifier] = props.min_stroke_length
                     break
-        gp_object.update_tag()
+        if props.live_updates:
+            gp_object.update_tag()
 
     line_material = _find_tagged(bpy.data.materials, MAT_GP_LINES)
     if line_material is not None and line_material.is_grease_pencil:
@@ -1918,6 +1919,9 @@ def _apply_lineart_radius(context):
         lineart.radius = _lineart_base_radius(props)
     _sync_screen_space_thickness(scene, props, gp_object)
 
+    if not props.live_updates:
+        return
+
     gp_object.update_tag()
     view_layer = getattr(context, "view_layer", None)
     if view_layer is not None:
@@ -2119,9 +2123,14 @@ class LINEART_OT_generate(Operator):
             if not baked:
                 self.report({'WARNING'}, "Strokes refreshed, but baking failed - "
                                          "bake manually from the Line Art modifier")
+                if not props.live_updates:
+                    _suspend_lineart_modifiers(live_off=True)
                 return {'FINISHED'}
             self.report({'INFO'}, "Line Art baked to keyframes (modifier deactivated)")
             return {'FINISHED'}
+
+        if not props.live_updates:
+            _suspend_lineart_modifiers(live_off=True)
 
         self.report({'INFO'}, "Line Art refreshed")
         return {'FINISHED'}
@@ -2343,7 +2352,7 @@ class LazyLineartProps(PropertyGroup):
                     "modifier - leave off while iterating on stills",
     )
     live_updates: BoolProperty(
-        name="Live Updates", default=True,
+        name="Live Updates", default=False,
         description="When off, panel sliders and scene edits no longer refresh Line Art "
                     "until you run Generate or turn updates back on",
         update=_on_live_updates_changed,
