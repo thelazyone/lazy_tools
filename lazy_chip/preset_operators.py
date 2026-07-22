@@ -154,6 +154,9 @@ class LAZYCHIP_OP_setdefaultsettings(Operator):
         weathering_props.random_seed_property = True
         weathering_props.fixed_scale_check_property = False
         weathering_props.fixed_scale_property = 1.0
+        weathering_props.attempts_property = 1
+        weathering_props.fix_between_steps_property = False
+        weathering_props.simplify_damage_ratio_property = 0.2
         return {'FINISHED'}
     
     

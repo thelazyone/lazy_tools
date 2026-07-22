@@ -46,6 +46,12 @@ class DamagePresets:
     fixed_scale_max = 20
     
     # Attempts
-    attempts_default = 5
+    attempts_default = 1
     attempts_min = 1
     attempts_max = 100
+
+    # Fix Between Steps
+    fix_between_steps_default = False
+
+    # Simplify Damage Ratio
+    simplify_damage_ratio_default = 0.2

@@ -11,7 +11,7 @@ bl_info = {
     "location": "View3d > Toolbar > Lazy Tools",
     "blender": (4, 0, 0),
     "category": "Object",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "description": "A suite of tools for mesh weathering and manipulation."
 }
 
