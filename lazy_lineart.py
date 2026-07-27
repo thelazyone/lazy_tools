@@ -67,6 +67,9 @@ GRUNGE_COORD_ROTATION_SCATTER = (
 GRUNGE_NOISE_THRESHOLD = 0.5
 GRUNGE_BLUR_RADIUS_SCALE = 0.12
 OBJ_RANDOM_SEED_SCALE = 997.0
+# How far shadow/grunge tints pull flats toward the picked hue after darkening.
+# 0 = luminance darken only (keep base hue); 1 = full COLOR replace.
+TINT_HUE_MIX = 0.55
 
 
 # ----------------------------------------------------------------------------
@@ -199,23 +202,47 @@ def _set_mix_b_color(mix_node, rgba):
     return False
 
 
+def _tint_luminance(rgba):
+    """Rec.709 luminance of an RGB(A) tint — used to darken without killing hue."""
+    return 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+
+
 def _masked_multiply_tint(tree, base, apply_mask, tint_rgba, x, y, prefix):
-    """Where apply_mask=1, darken base with a per-channel multiply (keeps hue)."""
-    mult, m_factor, a, b, product = _mix_rgba(tree, 'MULTIPLY')
+    """Where apply_mask=1, darken flats then blend in the tint's hue/sat.
+
+    1. Multiply by tint luminance — darkens without killing base chroma.
+    2. COLOR-blend the tint at that same value — candidate with the picked hue.
+    3. Mix those two — both base and tint contribute (not a full replace).
+    """
+    alpha = tint_rgba[3] if len(tint_rgba) > 3 else 1.0
+    lum = _tint_luminance(tint_rgba)
+
+    mult, m_factor, a, b, darkened = _mix_rgba(tree, 'MULTIPLY')
     mult.name = f"{prefix}_mult"
-    mult.location = (x - 160, y)
+    mult.location = (x - 480, y)
     m_factor.default_value = 1.0
-    b.default_value = (
-        tint_rgba[0], tint_rgba[1], tint_rgba[2],
-        tint_rgba[3] if len(tint_rgba) > 3 else 1.0,
-    )
+    b.default_value = (lum, lum, lum, alpha)
     tree.links.new(base, a)
+
+    color, c_factor, a, b, shifted = _mix_rgba(tree, 'COLOR')
+    color.name = f"{prefix}_color"
+    color.location = (x - 320, y)
+    c_factor.default_value = 1.0
+    b.default_value = (tint_rgba[0], tint_rgba[1], tint_rgba[2], alpha)
+    tree.links.new(darkened, a)
+
+    cast, cast_factor, a, b, combined = _mix_rgba(tree)
+    cast.name = f"{prefix}_cast"
+    cast.location = (x - 160, y)
+    cast_factor.default_value = TINT_HUE_MIX
+    tree.links.new(darkened, a)
+    tree.links.new(shifted, b)
 
     pick, factor, a, b, result = _mix_rgba(tree)
     pick.name = f"{prefix}_pick"
     pick.location = (x, y)
     tree.links.new(base, a)
-    tree.links.new(product, b)
+    tree.links.new(combined, b)
     tree.links.new(apply_mask, factor)
     return result
 
@@ -250,12 +277,21 @@ def _grunge_apply_mask(tree, grunge_white, x, y, prefix):
 
 def _set_compositor_tint_color(comp, key, rgba):
     """Push a tint color into the compositor nodes for one overlay pass."""
+    color = (rgba[0], rgba[1], rgba[2], rgba[3] if len(rgba) > 3 else 1.0)
     mult = comp.nodes.get(f"lzla_{key}_mult")
-    if mult is not None and _set_mix_b_color(mult, rgba):
+    hue = comp.nodes.get(f"lzla_{key}_color")
+    # New graph: luminance darken + COLOR candidate + mix toward tint hue.
+    if hue is not None:
+        updated = _set_mix_b_color(hue, color)
+        if mult is not None:
+            lum = _tint_luminance(color)
+            updated = _set_mix_b_color(mult, (lum, lum, lum, color[3])) or updated
+        return updated
+    # Legacy graph: single per-channel multiply.
+    if mult is not None and _set_mix_b_color(mult, color):
         return True
     rgb = comp.nodes.get(f"lzla_{key}_tint_color")
     if rgb is not None:
-        color = (rgba[0], rgba[1], rgba[2], rgba[3] if len(rgba) > 3 else 1.0)
         if hasattr(rgb, "color"):
             rgb.color = color[:3]
         rgb.outputs[0].default_value = color
@@ -264,7 +300,7 @@ def _set_compositor_tint_color(comp, key, rgba):
     if tint is not None:
         color_inputs = [s for s in tint.inputs if s.type == 'RGBA']
         if color_inputs:
-            color_inputs[0].default_value = tuple(rgba)
+            color_inputs[0].default_value = color
             return True
     return False
 
@@ -1891,9 +1927,23 @@ def _sync_compositor_tint_colors(scene):
         _set_compositor_tint_color(comp, key, tuple(tint_color))
 
 
+def _compositor_needs_hue_tint_rebuild(comp):
+    """True when the compositor lacks the darken + COLOR + mix tint graph."""
+    return (
+        comp.nodes.get("lzla_shadow_mult") is not None
+        and comp.nodes.get("lzla_shadow_cast") is None
+    )
+
+
 def _on_tint_color_changed(self, context):
     if context is None:
         return
+    comp = _find_tagged(bpy.data.node_groups, NG_COMPOSITOR)
+    if comp is not None and _compositor_needs_hue_tint_rebuild(comp):
+        try:
+            _build_compositor(context, context.scene.lazy_lineart_props)
+        except Exception:
+            traceback.print_exc()
     _sync_compositor_tint_colors(context.scene)
 
 
@@ -2227,7 +2277,7 @@ class LazyLineartProps(PropertyGroup):
     shadow_color: FloatVectorProperty(
         name="Shadow Color", subtype='COLOR', size=4,
         default=(0.55, 0.55, 0.62, 1.0), min=0.0, max=1.0,
-        description="Multiplier on flat colors in shaded regions (per-channel, preserves hue)",
+        description="Shadow tint: darkens by luminance, then blends this hue/sat into the flat",
         update=_on_tint_color_changed,
     )
     shadow_line_thickness: FloatProperty(
@@ -2261,7 +2311,7 @@ class LazyLineartProps(PropertyGroup):
     hard_shadow_color: FloatVectorProperty(
         name="Hard Shadow Color", subtype='COLOR', size=4,
         default=(0.0, 0.0, 0.0, 1.0), min=0.0, max=1.0,
-        description="Multiplier on flat colors in the deepest shadow (per-channel)",
+        description="Deep-shadow tint: darkens by luminance, then blends this hue/sat into the flat",
         update=_on_tint_color_changed,
     )
     hard_shadow_line_thickness: FloatProperty(
@@ -2278,7 +2328,7 @@ class LazyLineartProps(PropertyGroup):
     grunge_color: FloatVectorProperty(
         name="Grunge Color", subtype='COLOR', size=4,
         default=(0.8, 0.78, 0.72, 1.0), min=0.0, max=1.0,
-        description="Tint multiplied onto the flat colors inside grunge regions",
+        description="Grunge tint: darkens by luminance, then blends this hue/sat into the flat",
         update=_on_tint_color_changed,
     )
     grunge_line_thickness: FloatProperty(
