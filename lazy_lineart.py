@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 33),
+    "version": (0, 1, 37),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -13,6 +13,7 @@ bl_info = {
 
 import math
 import os
+import sys
 import time
 import traceback
 from datetime import datetime
@@ -1108,6 +1109,85 @@ def _ensure_view_layer(scene, name):
     return view_layer
 
 
+def _set_holdout_tree(layer_collection, holdout):
+    """Recursively set exclude/holdout on a LayerCollection and all children."""
+    layer_collection.exclude = False
+    layer_collection.holdout = holdout
+    for child in layer_collection.children:
+        _set_holdout_tree(child, holdout)
+
+
+def _apply_lines_holdouts(root_layer_collection, lineart_collection):
+    """Lines pass: keep every collection in the depsgraph, but hold out all
+    mesh content so only Grease Pencil strokes hit the beauty buffer.
+
+    Walks the full LayerCollection tree (not just direct scene children) so
+    collections added later - e.g. LZRG.Render Groups and its group
+    subcollections - get the same holdout treatment as the default Collection.
+    The lineart collection branch is never held out.
+    """
+    for child in root_layer_collection.children:
+        if child.collection == lineart_collection:
+            _set_holdout_tree(child, False)
+        else:
+            _set_holdout_tree(child, True)
+
+
+def _ensure_render_transparency(scene):
+    """Holdouts become opaque black unless Film Transparent is on. Re-assert
+    before every sync/render so a manual toggle or an old .blend can't stick."""
+    scene.render.film_transparent = True
+    scene.render.use_compositing = True
+    try:
+        scene.render.image_settings.color_mode = 'RGBA'
+        scene.render.image_settings.file_format = 'PNG'
+    except (AttributeError, TypeError):
+        pass
+
+
+def _sync_view_layer_collection_flags(scene, lineart_collection=None):
+    """Re-apply exclude/holdout flags on existing Lazy Line Art view layers.
+
+    Safe to call before every render: newly created collections (render groups,
+    extra scene collections) are picked up without rebuilding materials.
+    """
+    if lineart_collection is None:
+        lineart_collection = _find_tagged(bpy.data.collections, COL_LINEART)
+    if lineart_collection is None:
+        return False
+
+    _ensure_render_transparency(scene)
+
+    mesh_layers = (
+        scene.view_layers.get(VL_FLAT),
+        scene.view_layers.get(VL_SHADOW),
+        scene.view_layers.get(VL_HARD_SHADOW),
+        scene.view_layers.get(VL_GRUNGE),
+    )
+    for view_layer in mesh_layers:
+        if view_layer is None:
+            continue
+        lc = _layer_collection_for(view_layer.layer_collection, lineart_collection)
+        if lc is not None:
+            lc.exclude = True
+        # Mesh passes must not inherit leftover holdouts from the lines pass
+        # setup (holdout is per view layer, but clear explicitly for safety).
+        _clear_holdouts(view_layer.layer_collection)
+
+    vl_lines = scene.view_layers.get(VL_LINES)
+    if vl_lines is not None:
+        _apply_lines_holdouts(vl_lines.layer_collection, lineart_collection)
+    return True
+
+
+def _clear_holdouts(layer_collection):
+    """Ensure mesh view layers don't keep holdout flags (transparent film only
+    needs holdout on the lines pass)."""
+    layer_collection.holdout = False
+    for child in layer_collection.children:
+        _clear_holdouts(child)
+
+
 def _configure_view_layers(context, lineart_collection, props):
     scene = context.scene
     override_shadow = _build_override_shadow(props)
@@ -1126,16 +1206,9 @@ def _configure_view_layers(context, lineart_collection, props):
     # compute occlusion) but holds the mesh collections out so only strokes
     # remain in the image. Loose objects sitting directly in the scene root
     # collection can't be held out per-layer - keep scene content in
-    # collections for a clean lines pass.
-    for view_layer in (vl_flat, vl_shadow, vl_hard_shadow, vl_grunge):
-        lc = _layer_collection_for(view_layer.layer_collection, lineart_collection)
-        if lc is not None:
-            lc.exclude = True
-
-    for child in vl_lines.layer_collection.children:
-        is_lineart = child.collection == lineart_collection
-        child.exclude = False
-        child.holdout = not is_lineart
+    # collections for a clean lines pass. Nested trees (LZRG groups, etc.)
+    # are walked recursively so holdout applies to the whole branch.
+    _sync_view_layer_collection_flags(scene, lineart_collection)
 
     vl_flat.material_override = None
     vl_shadow.material_override = override_shadow
@@ -1591,19 +1664,23 @@ def _build_compositor(context, props):
     split_out.mute = True
 
     scene.compositing_node_group = tree
-    scene.render.use_compositing = True
-    scene.render.film_transparent = True
+    _ensure_render_transparency(scene)
     return tree
 
 
-def _arm_file_output(scene, split=False):
+def _arm_file_output(scene, split=False, group_name=None, stamp=None):
     """Put a fresh timestamped path on the requested File Output node (next to
-    the .blend) and mute the other one so only the requested files get written."""
+    the .blend) and mute the other one so only the requested files get written.
+
+    group_name: optional Lazy Render Groups name inserted into the filename.
+    stamp: optional shared timestamp so a batch render keeps one time prefix.
+    """
     if not bpy.data.is_saved:
         return None, "Save the .blend first"
     comp = scene.compositing_node_group
     if comp is None or comp.get(ID_PROP) != NG_COMPOSITOR:
         return None, "Run Build Pipeline first"
+    _ensure_render_transparency(scene)
     armed_name = FILE_OUT_SPLIT_NAME if split else FILE_OUT_NAME
     other_name = FILE_OUT_NAME if split else FILE_OUT_SPLIT_NAME
     node = comp.nodes.get(armed_name)
@@ -1614,20 +1691,56 @@ def _arm_file_output(scene, split=False):
         other.mute = True
     node.mute = False
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if stamp is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # Absolute path to the .blend's folder - the relative "//" prefix has
     # proven unreliable on the File Output node in some setups.
     blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
     node.directory = blend_dir + os.sep
+    group_bit = ""
+    if group_name:
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in group_name.strip())
+        safe = safe.strip("_") or "group"
+        group_bit = f"{safe}_"
     # Split slots are named "lines"/"flats", so the stamp lands before them:
-    # lazy_lineart_<stamp>_lines####.png / _flats####.png
-    node.file_name = f"lazy_lineart_{stamp}_" if split else f"lazy_lineart_{stamp}"
+    # lazy_lineart_<group_><stamp>_lines####.png / _flats####.png
+    if split:
+        node.file_name = f"lazy_lineart_{group_bit}{stamp}_"
+    else:
+        node.file_name = f"lazy_lineart_{group_bit}{stamp}"
     fmt = node.format
     if hasattr(fmt, "media_type"):
         fmt.media_type = 'IMAGE'
     fmt.file_format = 'PNG'
     fmt.color_mode = 'RGBA'
     return node.directory + node.file_name, None
+
+
+def _render_groups_module():
+    """Return the Lazy Render Groups module if that addon is loaded."""
+    mod = sys.modules.get("lazy_render_groups")
+    if mod is not None and hasattr(mod, "render_all_with_callback"):
+        return mod
+    # Extensions / nested installs: bl_ext.<repo>.lazy_render_groups
+    for name, candidate in sys.modules.items():
+        if name.rsplit(".", 1)[-1] != "lazy_render_groups":
+            continue
+        if candidate is not None and hasattr(candidate, "render_all_with_callback"):
+            return candidate
+    return None
+
+
+def _render_groups_available(scene):
+    """True when the Render Groups addon is loaded (checkbox can show)."""
+    return _render_groups_module() is not None
+
+
+def _render_groups_ready(scene):
+    """True when there is at least one valid group to iterate."""
+    mod = _render_groups_module()
+    if mod is None:
+        return False
+    return bool(getattr(mod, "has_render_groups", lambda _s: False)(scene))
 
 
 # ----------------------------------------------------------------------------
@@ -2151,6 +2264,7 @@ class LINEART_OT_generate(Operator):
             return {'CANCELLED'}
 
         _sync_settings(scene)
+        _sync_view_layer_collection_flags(scene)
         _restore_lineart_modifiers(force=True)
         gp_object.update_tag()
         context.view_layer.update()
@@ -2196,7 +2310,16 @@ class LINEART_OT_render_composite(Operator):
 
     def execute(self, context):
         scene = context.scene
+        props = scene.lazy_lineart_props
         _sync_settings(scene)
+        _sync_view_layer_collection_flags(scene)
+
+        if props.render_all_groups and _render_groups_available(scene):
+            if not _render_groups_ready(scene):
+                self.report({'ERROR'}, "Render All Groups is on, but no groups exist")
+                return {'CANCELLED'}
+            return self._render_all_groups(context)
+
         file_name, err = _arm_file_output(scene)
         if err:
             self.report({'ERROR'}, err)
@@ -2204,6 +2327,35 @@ class LINEART_OT_render_composite(Operator):
         scene.render.use_compositing = True
         bpy.ops.render.render('INVOKE_DEFAULT')
         self.report({'INFO'}, f"File Output → {file_name}Image.png")
+        return {'FINISHED'}
+
+    def _render_all_groups(self, context):
+        scene = context.scene
+        mod = _render_groups_module()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        last_path = None
+
+        def render_one(ctx, group_name):
+            nonlocal last_path
+            _sync_view_layer_collection_flags(ctx.scene)
+            file_name, err = _arm_file_output(
+                ctx.scene, split=False, group_name=group_name, stamp=stamp,
+            )
+            if err:
+                return err
+            ctx.scene.render.use_compositing = True
+            # File Output node writes the PNG; write_still would also dump to
+            # scene.render.filepath and can flatten alpha to black if color_mode
+            # is RGB.
+            bpy.ops.render.render(write_still=False)
+            last_path = file_name
+            return None
+
+        count, err = mod.render_all_with_callback(context, render_one)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Rendered {count} group(s) → {last_path or ''}")
         return {'FINISHED'}
 
 
@@ -2218,7 +2370,16 @@ class LINEART_OT_render_split(Operator):
 
     def execute(self, context):
         scene = context.scene
+        props = scene.lazy_lineart_props
         _sync_settings(scene)
+        _sync_view_layer_collection_flags(scene)
+
+        if props.render_all_groups and _render_groups_available(scene):
+            if not _render_groups_ready(scene):
+                self.report({'ERROR'}, "Render All Groups is on, but no groups exist")
+                return {'CANCELLED'}
+            return self._render_all_groups(context)
+
         file_name, err = _arm_file_output(scene, split=True)
         if err:
             self.report({'ERROR'}, err)
@@ -2226,6 +2387,35 @@ class LINEART_OT_render_split(Operator):
         scene.render.use_compositing = True
         bpy.ops.render.render('INVOKE_DEFAULT')
         self.report({'INFO'}, f"File Output → {file_name}lines.png + flats")
+        return {'FINISHED'}
+
+    def _render_all_groups(self, context):
+        scene = context.scene
+        mod = _render_groups_module()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        last_path = None
+
+        def render_one(ctx, group_name):
+            nonlocal last_path
+            _sync_view_layer_collection_flags(ctx.scene)
+            file_name, err = _arm_file_output(
+                ctx.scene, split=True, group_name=group_name, stamp=stamp,
+            )
+            if err:
+                return err
+            ctx.scene.render.use_compositing = True
+            bpy.ops.render.render(write_still=False)
+            last_path = file_name
+            return None
+
+        count, err = mod.render_all_with_callback(context, render_one)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        self.report(
+            {'INFO'},
+            f"Rendered {count} group(s) split → {last_path or ''}lines + flats",
+        )
         return {'FINISHED'}
 
 
@@ -2401,6 +2591,12 @@ class LazyLineartProps(PropertyGroup):
         description="Bake Line Art to keyframes on Generate. Baking deactivates the "
                     "modifier - leave off while iterating on stills",
     )
+    render_all_groups: BoolProperty(
+        name="Render All Groups", default=False,
+        description="When Lazy Render Groups is active, Render Composite / Split "
+                    "cycles through every group (blocking stills) instead of only "
+                    "the currently visible one",
+    )
     live_updates: BoolProperty(
         name="Live Updates", default=False,
         description="When off, panel sliders and scene edits no longer refresh Line Art "
@@ -2437,6 +2633,8 @@ class LINEART_PT_lazy_panel(Panel):
         col.operator(LINEART_OT_generate.bl_idname, icon='MOD_LINEART')
         col.operator(LINEART_OT_render_composite.bl_idname, icon='RENDER_STILL')
         col.operator(LINEART_OT_render_split.bl_idname, icon='RENDERLAYERS')
+        if _render_groups_available(context.scene):
+            layout.prop(props, "render_all_groups")
 
         layout.separator()
         layout.label(text="Strokes:")
