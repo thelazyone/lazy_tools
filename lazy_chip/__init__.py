@@ -10,7 +10,7 @@ bl_info = {
     "location": "View3D > Sidebar > Lazy Tools",
     "blender": (5, 1, 0),
     "category": "Object",
-    "version": (1, 0, 3),
+    "version": (1, 0, 4),
     "description": "A suite of tools for mesh weathering and manipulation.",
     "warning": "",
     "doc_url": "https://github.com/thelazyone/lazy_tools",

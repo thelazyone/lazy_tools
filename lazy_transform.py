@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Transform Tools",
     "author": "thelazyone",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Provides random transformation tools for selected objects",
@@ -11,13 +11,12 @@ bl_info = {
 }
 
 import bpy
-import bmesh
 import math
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import FloatProperty
 import random
 import mathutils
-from mathutils import Vector, Matrix
+from mathutils import Vector
 
 
 class LazyTransformSettings(PropertyGroup):

@@ -1,6 +1,5 @@
 import bpy
 import bmesh
-from bpy.types import Operator
 
 # Mesh utilities.
 

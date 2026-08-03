@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Materials",
     "author": "thelazyone",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Provides multiple tools for handling materials and UV maps",
@@ -11,9 +11,7 @@ bl_info = {
 }
 
 import bpy
-import bmesh
 from bpy.types import Operator, Panel
-from bpy.props import IntProperty
 import math as m
 import random   # for UV settings
 import colorsys  # for Palette

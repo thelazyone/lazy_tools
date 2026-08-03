@@ -1,9 +1,6 @@
 import bpy
-from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import IntProperty, FloatProperty, PointerProperty, BoolProperty
+from bpy.types import Operator, Panel
 import math
-import bmesh
-from mathutils.bvhtree import BVHTree
 from mathutils import Vector
 
 import random
@@ -17,7 +14,7 @@ from math import radians
 bl_info = {
     "name": "Lazy Crack",
     "author": "thelazyone",
-    "version": (1, 0, 9),
+    "version": (1, 0, 10),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Apply volumetric cracks with infill",

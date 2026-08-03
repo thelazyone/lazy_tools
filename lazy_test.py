@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Tests",
     "author": "thelazyone",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Testing new utilities in a dedicated panel",
@@ -12,7 +12,6 @@ bl_info = {
 
 import bpy
 from bpy.types import Operator, Panel
-from mathutils import Vector, Matrix
 
 
 

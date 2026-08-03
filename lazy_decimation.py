@@ -1,6 +1,6 @@
 import bpy
-from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import IntProperty, FloatProperty, PointerProperty, BoolProperty
+from bpy.types import Operator, Panel
+from bpy.props import FloatProperty, BoolProperty
 import math
 import bmesh
 from mathutils.bvhtree import BVHTree
@@ -9,7 +9,7 @@ from mathutils import Vector
 bl_info = {
     "name": "Lazy Decimation",
     "author": "thelazyone",
-    "version": (1, 0, 9),
+    "version": (1, 0, 10),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Decimate meshes with extra checks.",

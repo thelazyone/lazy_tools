@@ -1,6 +1,4 @@
 import bpy
-import bmesh
-import mathutils
 import random
 from bpy.types import Operator
 

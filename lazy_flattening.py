@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Flattening",
     "author": "thelazyone",
-    "version": (1, 1, 1),
+    "version": (1, 1, 2),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Crops meshes along a world-space Z plane",
@@ -13,7 +13,6 @@ bl_info = {
 import bpy
 from bpy.types import Operator, Panel
 from bpy.props import FloatProperty
-import math
 import bmesh
 
 # Tolerance for "is this vertex sitting on the cut plane", in world units.

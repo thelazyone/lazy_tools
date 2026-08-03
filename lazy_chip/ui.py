@@ -1,6 +1,6 @@
 import bpy
 from bpy.types import Panel, PropertyGroup
-from bpy.props import IntProperty, FloatProperty, PointerProperty
+from bpy.props import IntProperty, FloatProperty
 
 class WeatheringProps(PropertyGroup):
     resolution_property: IntProperty(name="Resolution", default=64, min=16, max=4096)
