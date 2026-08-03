@@ -7,14 +7,14 @@ from mathutils.bvhtree import BVHTree
 from mathutils import Vector
 
 bl_info = {
-    "name": "Smart Decimation",
+    "name": "Lazy Decimation",
     "author": "thelazyone",
-    "version": (1, 0, 7),
-    "blender": (4, 0, 0),
+    "version": (1, 0, 9),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Decimate meshes with extra checks.",
     "warning": "",
-    "wiki_url": "",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "Mesh",
 }
 
@@ -229,8 +229,9 @@ def _process_decimate_object(obj, context, settings, decimate_ratio, do_remesh):
 # Decimating the mesh, then calling (conditionally) the fix_mesh function.
 class MESH_OT_decimate_and_fix(Operator):
     bl_idname = "mesh.decimate_and_fix"
-    bl_label = "Smart Decimation"
+    bl_label = "Lazy Decimation"
     bl_description = "Automates the process of adding a Decimate modifier, applying it, and fixing mesh issues"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
@@ -281,12 +282,14 @@ class MESH_OT_quick_decimate(Operator):
     bl_description = (
         "Decimate at the chosen ratio without remesh; UI ratio and remesh options are ignored"
     )
+    bl_options = {'REGISTER', 'UNDO'}
 
     ratio: FloatProperty(
         name="Ratio",
         description="Decimate ratio for this operation only",
         min=0.01,
         max=1.0,
+        default=0.5,
     )
 
     @classmethod
@@ -330,6 +333,7 @@ class MESH_OT_just_fix(Operator):
     bl_idname = "mesh.just_fix"
     bl_label = "Just Fix"
     bl_description = "Fix mesh issues without decimation"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
@@ -347,12 +351,13 @@ class MESH_OT_just_fix(Operator):
     
 
 class MESH_PT_decimate_and_fix(Panel):
-    bl_idname = "LazyDecimation"
+    bl_idname = "LAZYDEC_PT_main"
     bl_label = "Lazy Decimation"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Lazy Tools'
     bl_context = "objectmode"
+    bl_order = 40
 
     @classmethod
     def poll(cls, context):
@@ -388,20 +393,21 @@ class MESH_PT_decimate_and_fix(Panel):
 
 
 def register():
+    bpy.utils.register_class(DecimateAndFixSettings)
     bpy.utils.register_class(MESH_OT_decimate_and_fix)
     bpy.utils.register_class(MESH_OT_quick_decimate)
-    bpy.utils.register_class(MESH_PT_decimate_and_fix)
     bpy.utils.register_class(MESH_OT_just_fix)
-    bpy.utils.register_class(DecimateAndFixSettings)
+    bpy.utils.register_class(MESH_PT_decimate_and_fix)
     bpy.types.Scene.decimate_and_fix_settings = bpy.props.PointerProperty(type=DecimateAndFixSettings)
 
 def unregister():
-    bpy.utils.unregister_class(MESH_OT_decimate_and_fix)
-    bpy.utils.unregister_class(MESH_OT_quick_decimate)
+    # Drop the Scene pointer before freeing the PropertyGroup it points at.
+    del bpy.types.Scene.decimate_and_fix_settings
     bpy.utils.unregister_class(MESH_PT_decimate_and_fix)
     bpy.utils.unregister_class(MESH_OT_just_fix)
+    bpy.utils.unregister_class(MESH_OT_quick_decimate)
+    bpy.utils.unregister_class(MESH_OT_decimate_and_fix)
     bpy.utils.unregister_class(DecimateAndFixSettings)
-    del bpy.types.Scene.decimate_and_fix_settings
 
 if __name__ == "__main__":
     register()

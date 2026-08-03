@@ -1,10 +1,12 @@
 bl_info = {
     "name": "Lazy Reloader",
     "author": "thelazyone",
-    "version": (0, 1, 6),
-    "blender": (4, 0, 0),
+    "version": (0, 1, 7),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Hard-reload addons that register panels in the Lazy Tools sidebar",
+    "warning": "",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "Development",
 }
 
@@ -420,16 +422,19 @@ class LAZYRELOAD_OT_reload(Operator):
 
 
 class LAZYRELOAD_PT_panel(Panel):
-    # Leading "AAA_" wins alphabetical tie-break among bl_order == 0 panels.
-    bl_idname = "AAA_PT_lazy_reload"
+    bl_idname = "LAZYRELOAD_PT_main"
     bl_label = "Lazy Reloader"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = LAZY_CATEGORY
-    # Must be >= 0 (negative values get clamped/wrapped and end up at the bottom).
+    # Sidebar ordering for the whole suite is set explicitly via bl_order:
+    #   0 Reloader | 10 Chip | 20 Crack | 30 Flattening | 40 Decimation
+    #   50 Materials | 60 Transform | 70 Local View | 80 Render Groups
+    #   90 Line Art | 100 Tests
+    # bl_order is unsigned, so 0 is as high as a panel can go. Relying on the
+    # old "AAA_" idname prefix did not work: panels with an equal bl_order fall
+    # back to registration order, not alphabetical order.
     bl_order = 0
-
-
 
     def draw(self, context):
         layout = self.layout

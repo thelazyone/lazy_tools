@@ -1,27 +1,42 @@
 bl_info = {
     "name": "Lazy Local View",
     "author": "thelazyone",
-    "version": (1, 1),
-    "blender": (4, 0, 0),
-    "location": "Shift+/ in the 3D Viewport",
+    "version": (1, 1, 1),
+    "blender": (5, 1, 0),
+    "location": "View3D > Sidebar > Lazy Tools, or Shift+/ in the 3D Viewport",
     "description": "Local view on selection while keeping all scene lights visible",
     "warning": "",
-    "wiki_url": "",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "View",
 }
 
 import bpy
-from bpy.types import Operator
+from bpy.types import Operator, Panel
 
 addon_keymaps = []
 
 SHORTCUT_KEY = 'SLASH'
 SHORTCUT_MODIFIERS = dict(shift=True)
 
+# 'Object Mode' and 'Mesh' are EMPTY-space keymaps in Blender; only
+# '3D View Generic' lives in VIEW_3D. Passing the wrong space_type to
+# keymaps.new() creates a brand new keymap instead of extending the
+# existing one, which left those two bindings inert.
+KEYMAP_SPACES = (
+    ('3D View Generic', 'VIEW_3D'),
+    ('Object Mode', 'EMPTY'),
+    ('Mesh', 'EMPTY'),
+)
+
 
 def _view3d_context(context):
     area = context.area if context.area and context.area.type == 'VIEW_3D' else None
-    region = context.region if area is context.area else None
+
+    # Only a WINDOW region is usable by view3d.localview. When this runs from the
+    # sidebar button, context.region is the UI region, so it must not be reused.
+    region = context.region if (area is context.area and context.region
+                                and context.region.type == 'WINDOW') else None
+
     if area is None:
         for candidate in context.screen.areas:
             if candidate.type == 'VIEW_3D':
@@ -90,8 +105,29 @@ class VIEW3D_OT_local_view_with_lights(Operator):
         return {'FINISHED'}
 
 
-def _register_keymap(kc, km_name, key_type):
-    km = kc.keymaps.new(name=km_name, space_type='VIEW_3D')
+class VIEW3D_PT_lazy_local_view(Panel):
+    bl_idname = "LAZYLOCALVIEW_PT_main"
+    bl_label = "Lazy Local View"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Lazy Tools'
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 70
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column()
+        col.scale_y = 1.4
+        col.operator(
+            VIEW3D_OT_local_view_with_lights.bl_idname,
+            text="Toggle Local View",
+            icon='ZOOM_SELECTED',
+        )
+        layout.label(text="Shortcut: Shift + /", icon='EVENT_SHIFT')
+
+
+def _register_keymap(kc, km_name, space_type, key_type):
+    km = kc.keymaps.new(name=km_name, space_type=space_type)
     kmi = km.keymap_items.new(
         VIEW3D_OT_local_view_with_lights.bl_idname,
         type=key_type,
@@ -104,20 +140,25 @@ def _register_keymap(kc, km_name, key_type):
 
 def register():
     bpy.utils.register_class(VIEW3D_OT_local_view_with_lights)
+    bpy.utils.register_class(VIEW3D_PT_lazy_local_view)
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc is None:
         return
 
-    for km_name in ('3D View Generic', 'Object Mode', 'Mesh'):
+    for km_name, space_type in KEYMAP_SPACES:
         for key_type in (SHORTCUT_KEY, 'NUMPAD_SLASH'):
-            _register_keymap(kc, km_name, key_type)
+            _register_keymap(kc, km_name, space_type, key_type)
 
 
 def unregister():
     for km, kmi in addon_keymaps:
-        km.keymap_items.remove(kmi)
+        try:
+            km.keymap_items.remove(kmi)
+        except (RuntimeError, ReferenceError):
+            pass  # Keymap already torn down by Blender
     addon_keymaps.clear()
+    bpy.utils.unregister_class(VIEW3D_PT_lazy_local_view)
     bpy.utils.unregister_class(VIEW3D_OT_local_view_with_lights)
 
 

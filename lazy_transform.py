@@ -1,22 +1,34 @@
 bl_info = {
     "name": "Lazy Transform Tools",
     "author": "thelazyone",
-    "version": (1, 0),
-    "blender": (4, 0, 0),
+    "version": (1, 0, 1),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Provides random transformation tools for selected objects",
     "warning": "",
-    "wiki_url": "",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "Object",
 }
 
 import bpy
 import bmesh
-from bpy.types import Operator, Panel
+import math
+from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import FloatProperty
 import random
 import mathutils
 from mathutils import Vector, Matrix
+
+
+class LazyTransformSettings(PropertyGroup):
+    scale_variation: FloatProperty(
+        name="Scale Variation",
+        description="Maximum scale variation, in percent",
+        default=10.0,
+        min=0.1,
+        max=50.0,
+        unit='NONE',
+    )
 
 
 class TRANSFORM_OT_random_rotation_z(Operator):
@@ -35,9 +47,8 @@ class TRANSFORM_OT_random_rotation_z(Operator):
         for obj in selected_objects:
             if obj.type == 'MESH':
                 # Generate random rotation angle between 0 and 360 degrees
-                random_angle = random.uniform(0, 360)
-                random_radians = random_angle * (3.14159 / 180)  # Convert to radians
-                
+                random_radians = math.radians(random.uniform(0, 360))
+
                 # Create rotation matrix for Z-axis
                 rotation_matrix = mathutils.Matrix.Rotation(random_radians, 4, 'Z')
                 
@@ -71,9 +82,8 @@ class TRANSFORM_OT_random_rotation_all(Operator):
                 
                 for axis in rotation_sequence:
                     # Generate random angle between 0 and 360 degrees
-                    random_angle = random.uniform(0, 360)
-                    random_radians = random_angle * (3.14159 / 180)
-                    
+                    random_radians = math.radians(random.uniform(0, 360))
+
                     # Create rotation matrix for current axis
                     rotation_matrix = mathutils.Matrix.Rotation(random_radians, 4, axis)
                     
@@ -93,6 +103,8 @@ class TRANSFORM_OT_random_scale(Operator):
     bl_description = "Randomly scales selected objects by up to 10% (both up and down)"
     bl_options = {'REGISTER', 'UNDO'}
 
+    # Mirrored from the scene settings by the panel, and kept here so the F9
+    # redo panel can tweak it after the fact.
     scale_variation: FloatProperty(
         name="Scale Variation",
         description="Maximum scale variation percentage",
@@ -135,8 +147,15 @@ class OBJECT_OT_set_local_z_to_view(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == 'MESH'
-    
+        # region_data is None outside a 3D viewport, and transform_apply below
+        # only works in object mode.
+        return (
+            context.active_object is not None
+            and context.active_object.type == 'MESH'
+            and context.mode == 'OBJECT'
+            and getattr(context, "region_data", None) is not None
+        )
+
     def execute(self, context):
         obj = context.active_object
 
@@ -174,28 +193,32 @@ class TRANSFORM_PT_lazy_panel(Panel):
     bl_region_type = 'UI'
     bl_category = 'Lazy Tools'
     bl_context = ""
+    bl_order = 60
 
     def draw(self, context):
         layout = self.layout
+        settings = context.scene.lazy_transform_settings
 
         # Check if objects are selected
         objects_selected = len(context.selected_objects) > 0 and context.mode == 'OBJECT'
         active_object = context.active_object is not None and context.active_object.type == 'MESH'
-        
+
         layout.label(text="Random Transformations")
-        
+
         col = layout.column()
         col.enabled = objects_selected
-        
+
         col.operator(TRANSFORM_OT_random_rotation_z.bl_idname)
         col.operator(TRANSFORM_OT_random_rotation_all.bl_idname)
-        
-        # Scale section with property
+
+        # Scale section. The slider lives on the scene so it survives redraws;
+        # its value is pushed into the operator when the button is built.
         col.separator()
         col.label(text="Random Scale:")
+        col.prop(settings, "scale_variation", text="Variation %")
         scale_op = col.operator(TRANSFORM_OT_random_scale.bl_idname)
-        col.prop(scale_op, "scale_variation", text="Variation %")
-        
+        scale_op.scale_variation = settings.scale_variation
+
         layout.separator()
         layout.label(text="Pose Tools")
         
@@ -208,19 +231,24 @@ class TRANSFORM_PT_lazy_panel(Panel):
 
 
 def register():
+    bpy.utils.register_class(LazyTransformSettings)
     bpy.utils.register_class(TRANSFORM_OT_random_rotation_z)
     bpy.utils.register_class(TRANSFORM_OT_random_rotation_all)
     bpy.utils.register_class(TRANSFORM_OT_random_scale)
     bpy.utils.register_class(OBJECT_OT_set_local_z_to_view)
     bpy.utils.register_class(TRANSFORM_PT_lazy_panel)
+    bpy.types.Scene.lazy_transform_settings = bpy.props.PointerProperty(type=LazyTransformSettings)
 
 
 def unregister():
-    bpy.utils.unregister_class(TRANSFORM_OT_random_rotation_z)
-    bpy.utils.unregister_class(TRANSFORM_OT_random_rotation_all)
-    bpy.utils.unregister_class(TRANSFORM_OT_random_scale)
-    bpy.utils.unregister_class(OBJECT_OT_set_local_z_to_view)
+    # Drop the Scene pointer before freeing the PropertyGroup it points at.
+    del bpy.types.Scene.lazy_transform_settings
     bpy.utils.unregister_class(TRANSFORM_PT_lazy_panel)
+    bpy.utils.unregister_class(OBJECT_OT_set_local_z_to_view)
+    bpy.utils.unregister_class(TRANSFORM_OT_random_scale)
+    bpy.utils.unregister_class(TRANSFORM_OT_random_rotation_all)
+    bpy.utils.unregister_class(TRANSFORM_OT_random_rotation_z)
+    bpy.utils.unregister_class(LazyTransformSettings)
 
 
 if __name__ == "__main__":

@@ -15,18 +15,18 @@ from math import radians
 # * scale of crack detail should be absolute not relative to the object
 
 bl_info = {
-    "name": "Smart Cracks",
+    "name": "Lazy Crack",
     "author": "thelazyone",
-    "version": (1, 0, 6),
-    "blender": (4, 0, 0),
+    "version": (1, 0, 9),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Apply volumetric cracks with infill",
     "warning": "",
-    "wiki_url": "",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "Mesh",
 }
 
-class crack_settings(bpy.types.PropertyGroup):
+class CrackSettings(bpy.types.PropertyGroup):
     fill_crack: bpy.props.BoolProperty(name="Fill Crack", default=False)
     center_geometry: bpy.props.BoolProperty(name="Center Origin", default=True)
     noise_scale: bpy.props.FloatProperty(name="Noise Scale", default=1.5, min=0.1, max=10.0)
@@ -36,10 +36,11 @@ class crack_settings(bpy.types.PropertyGroup):
     noise_intensity: bpy.props.FloatProperty(name="Noise Intensity", default=1.6, min=0.1, max=10.0)
 
 
-class operator_crack(Operator):
+class MESH_OT_crack(Operator):
     bl_idname = "mesh.crack"
     bl_label = "Crack Volumes"
     bl_description = "Performs a volumetric crack on a given volume with infill"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
@@ -354,13 +355,14 @@ class operator_crack(Operator):
 
 
 
-class panel_crack(Panel):
-    bl_idname = "LazyCrack"
+class LAZYCRACK_PT_main(Panel):
+    bl_idname = "LAZYCRACK_PT_main"
     bl_label = "Lazy Crack"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Lazy Tools'
     bl_context = "objectmode"
+    bl_order = 20
 
     @classmethod
     def poll(cls, context):
@@ -385,16 +387,17 @@ class panel_crack(Panel):
 
 
 def register():
-    bpy.utils.register_class(operator_crack)
-    bpy.utils.register_class(panel_crack)
-    bpy.utils.register_class(crack_settings)
-    bpy.types.Scene.crack_settings = bpy.props.PointerProperty(type=crack_settings)
+    bpy.utils.register_class(CrackSettings)
+    bpy.utils.register_class(MESH_OT_crack)
+    bpy.utils.register_class(LAZYCRACK_PT_main)
+    bpy.types.Scene.crack_settings = bpy.props.PointerProperty(type=CrackSettings)
 
 def unregister():
-    bpy.utils.unregister_class(operator_crack)
-    bpy.utils.unregister_class(panel_crack)
-    bpy.utils.unregister_class(crack_settings)
+    # Drop the Scene pointer before freeing the PropertyGroup it points at.
     del bpy.types.Scene.crack_settings
+    bpy.utils.unregister_class(LAZYCRACK_PT_main)
+    bpy.utils.unregister_class(MESH_OT_crack)
+    bpy.utils.unregister_class(CrackSettings)
 
 if __name__ == "__main__":
     register()

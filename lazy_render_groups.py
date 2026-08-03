@@ -1,13 +1,13 @@
 bl_info = {
     "name": "Lazy Render Groups",
     "author": "thelazyone",
-    "version": (0, 1, 3),
-    "blender": (4, 0, 0),
+    "version": (0, 1, 4),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Organize models into render groups (collections). Switch which "
                    "group is visible/rendered, and batch-render all of them.",
     "warning": "Early prototype",
-    "wiki_url": "",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "3D View",
 }
 
@@ -622,6 +622,7 @@ class LZRG_PT_panel(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Lazy Tools'
+    bl_order = 80
 
     def draw(self, context):
         layout = self.layout

@@ -1,12 +1,12 @@
 bl_info = {
     "name": "Lazy Materials",
     "author": "thelazyone",
-    "version": (1, 0),
-    "blender": (4, 0, 0),
+    "version": (1, 0, 1),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Provides multiple tools for handling materials and UV maps",
     "warning": "",
-    "wiki_url": "",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "Mesh",
 }
 
@@ -624,11 +624,6 @@ class MATERIAL_OT_view_ao(bpy.types.Operator):
 class MATERIAL_OT_view_both(bpy.types.Operator):
     bl_idname = "material.view_both"
     bl_label = "View Combined Material"
-    bl_description = "Switches to a material that combines color and AO"
-
-class MATERIAL_OT_view_both(bpy.types.Operator):
-    bl_idname = "material.view_both"
-    bl_label = "View Combined Material"
     bl_description = "Creates and switches to a material that combines color and AO"
 
     def execute(self, context):
@@ -1052,6 +1047,7 @@ class MATERIAL_PT_custom_panel(Panel):
     bl_region_type = 'UI'
     bl_category = 'Lazy Tools'
     bl_context = "" # If nothing is set here it'll work in edit mode too.
+    bl_order = 50
 
 
     def draw(self, context):
@@ -1139,7 +1135,7 @@ def register():
     bpy.utils.register_class(MATERIAL_PT_custom_panel)
 
 def unregister():
-    bpy.utils.unregister_class(ExtendedMaterialSettings)
+    # Drop the Scene pointer before freeing the PropertyGroup it points at.
     del bpy.types.Scene.extended_material_settings
 
     bpy.utils.unregister_class(MATERIAL_OT_remove_unused_materials)
@@ -1158,6 +1154,7 @@ def unregister():
     bpy.utils.unregister_class(MATERIAL_OT_view_ao)
     bpy.utils.unregister_class(MATERIAL_OT_view_both)
     bpy.utils.unregister_class(MATERIAL_PT_custom_panel)
+    bpy.utils.unregister_class(ExtendedMaterialSettings)
 
 if __name__ == "__main__":
     register()

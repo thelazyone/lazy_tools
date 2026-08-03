@@ -1,13 +1,13 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 37),
-    "blender": (5, 0, 0),
+    "version": (0, 1, 38),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
                    "Grease Pencil Line Art with stroke filtering, and a compositor combine.",
-    "warning": "Early prototype targeting Blender 5.0+",
-    "wiki_url": "",
+    "warning": "Early prototype targeting Blender 5.1+",
+    "doc_url": "https://github.com/thelazyone/lazy_tools",
     "category": "3D View",
 }
 
@@ -2622,6 +2622,7 @@ class LINEART_PT_lazy_panel(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Lazy Tools'
+    bl_order = 90
 
     def draw(self, context):
         layout = self.layout

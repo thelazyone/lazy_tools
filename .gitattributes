@@ -1,0 +1,13 @@
+# Normalise line endings so diffs show real changes only.
+# Files are stored LF in the repo and checked out LF on disk, which is what
+# Blender and Python both expect on every platform.
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+*.zip  binary
+*.blend binary
+*.png  binary
+*.jpg  binary

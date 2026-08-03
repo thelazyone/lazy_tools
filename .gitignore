@@ -1,1 +1,13 @@
+# Packaged add-ons
 *.zip
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

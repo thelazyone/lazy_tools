@@ -1,13 +1,25 @@
-# lazy tools
-A suite of tools for mesh weathering and manipulation in Blender.
-It's tools I'm using for my own workflow, even though they're not game-changers it makes sense for me to keep them all in the same suite.
+# Lazy Tools
 
+A suite of Blender add-ons for mesh weathering and manipulation, used in my own miniature
+sculpting workflow. Every tool lives in the **Lazy Tools** tab of the 3D viewport sidebar.
 
-Current tools are: 
-* Chip: Based on PolyDamage, with added functionalities and much needed fixes.
-* Decimation: A simple decimation tool, with a round of manifold fix after the operation.
-* Flattening: Manipulates the mesh to delete everything below Z = 0. Unlike boolean operations, this one works.
-* Dematerial: Simply removes any material from the selected objects.
-* Render Groups: Organize several models in one studio file into switchable collections. Create a group from selection, pick which group is visible/rendered from the sidebar, and batch-render all of them. When Lazy Line Art is also enabled, its render buttons gain a "Render All Groups" checkbox.
-* NPR: Experimental viewport line preview (silhouette, creases, material and open-edge boundaries) for NPR work. Early prototype: recomputes on demand via an "Update Lines" button rather than every frame.
-* Line Art (Blender 5.0+): One-click NPR pipeline. Builds a tagged collection with a Grease Pencil Line Art object (plus a Geometry Nodes min-length stroke filter), view layers with material overrides (flat colors, toon shadow on matte white, grunge mask), and a compositor tree that edge-detects shadow/grunge contours and combines all passes. Re-running Build Pipeline converges instead of duplicating.
+Targets Blender 5.1.
+
+## Tools
+
+* **Lazy Reloader** — hot-reloads any Lazy Tools add-on from source, without restarting Blender.
+* **Lazy Chip** — mesh chipping and weathering, with presets for wood, stone and concrete.
+* **Lazy Crack** — volumetric cracks with infill, placed interactively.
+* **Lazy Flattening** — crops a mesh at a world-space Z plane and caps the opening.
+* **Lazy Decimation** — decimation with an optional remesh pass and manifold cleanup afterwards.
+* **Lazy Materials** — material cleanup, UV generation, colour palettes and AO baking.
+* **Lazy Transform Tools** — random rotation and scale for selected objects, plus view-aligned posing.
+* **Lazy Local View** — isolates the selection while keeping every scene light visible (Shift + /).
+* **Lazy Render Groups** — organises models into switchable collections and batch-renders them.
+* **Lazy Line Art** — one-click NPR pipeline: line art, shadow and grunge passes, compositor combine.
+* **Lazy Tests** — scratch panel for utilities in progress.
+
+## Install
+
+Install each `.py` file (or the `lazy_chip` folder) as a Blender add-on. Point Lazy Reloader at
+this repo in its preferences to reload the others in place while editing.

@@ -20,10 +20,11 @@ class WeatheringProps(PropertyGroup):
 
 class WeatheringPanel(Panel):
     bl_label = "Lazy Chip"
-    bl_idname = "LazyChip"
+    bl_idname = "LAZYCHIP_PT_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Lazy Tools'
+    bl_order = 10
 
     def draw(self, context):
         layout = self.layout
@@ -92,14 +93,19 @@ class WeatheringPanel(Panel):
         curr_column.operator("lazychip.op_concretechippingedges")
         curr_column.operator("lazychip.op_concreteheavyweathering")
 
-# TO BE DONE PROPERLY
+# NOT REGISTERED YET — deliberately left out of register() so the panel layout is
+# unchanged. The idnames below are now correct, so adding it to register() is safe:
+# it used to declare bl_idname "LazyChip", which collided with WeatheringPanel and
+# made the panel its own parent.
 class LazyChipInfoPanel(Panel):
     bl_label = "Info"
-    bl_idname = "LazyChip"
+    bl_idname = "LAZYCHIP_PT_info"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_parent_id = 'LazyChip'
+    bl_category = 'Lazy Tools'
+    bl_parent_id = 'LAZYCHIP_PT_main'
     bl_options = {'DEFAULT_CLOSED'}
+
     def draw(self, context):
         layout = self.layout
         curr_column = layout.column()
@@ -110,6 +116,8 @@ class LazyChipInfoPanel(Panel):
         curr_column.label(text="https://github.com/thelazyone/lazy-chip")
         curr_column.label(text="https://www.myminifactory.com/users/TheLazyForger")
 
+# This module owns WeatheringProps and the Scene.weathering_props pointer.
+# __init__.py must not create or delete that pointer as well.
 def register():
     # Adding the params sliders:
     try:
@@ -127,6 +135,7 @@ def unregister():
         bpy.utils.unregister_class(WeatheringPanel)
     except ValueError:
         pass  # Class wasn't registered, ignore
+    # Drop the Scene pointer before freeing the PropertyGroup it points at.
     if hasattr(bpy.types.Scene, 'weathering_props'):
         del bpy.types.Scene.weathering_props
     try:
