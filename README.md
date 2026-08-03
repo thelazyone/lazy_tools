@@ -19,6 +19,14 @@ Targets Blender 5.1.
 * **Lazy Line Art** — one-click NPR pipeline: line art, shadow and grunge passes, compositor combine.
 * **Lazy Tests** — scratch panel for utilities in progress.
 
+## External dependency
+
+**Lazy Chip's Fix Manifold, Apply Damage and Lazy Tests need the
+[3D Print Toolbox](https://extensions.blender.org/add-ons/print3d-toolbox/) extension.** It is
+not bundled with Blender any more, so install it yourself from *Preferences > Get Extensions*.
+Without it those tools report an error and Lazy Chip shows a warning in the panel; everything
+else works normally.
+
 ## Install
 
 Install each `.py` file (or the `lazy_chip` folder) as a Blender add-on. Point Lazy Reloader at

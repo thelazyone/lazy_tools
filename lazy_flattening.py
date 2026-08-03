@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Flattening",
     "author": "thelazyone",
-    "version": (1, 1, 2),
+    "version": (1, 1, 3),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Crops meshes along a world-space Z plane",
@@ -130,12 +130,19 @@ class MESH_OT_flatten_vertices(Operator):
         # Return to object mode
         bpy.ops.object.mode_set(mode='OBJECT')
 
-        # Process each island separately
-        for separated_obj in context.selected_objects:
-            if separated_obj is obj:
-                continue
+        # separate() keeps one island in the original object and moves the rest
+        # into new ones, so the whole result is in the selection - the original
+        # included. It used to be skipped here, which left that island uncapped.
+        islands = [o for o in context.selected_objects if o.type == 'MESH']
 
-            context.view_layer.objects.active = separated_obj
+        # Process each island separately
+        for island in islands:
+            # Isolate the island first: with several meshes selected, entering
+            # edit mode opens them all at once and the operators below would
+            # run across every island instead of just this one.
+            bpy.ops.object.select_all(action='DESELECT')
+            island.select_set(True)
+            context.view_layer.objects.active = island
 
             # Enter edit mode
             bpy.ops.object.mode_set(mode='EDIT')
@@ -145,8 +152,12 @@ class MESH_OT_flatten_vertices(Operator):
             bpy.ops.mesh.region_to_loop()
             bpy.ops.object.mode_set(mode='OBJECT')
 
-            connect_vertices_on_plane(separated_obj, z_level, 0.1)
+            connect_vertices_on_plane(island, z_level, 0.1)
 
+        # Hand back every island selected, with the original object active
+        bpy.ops.object.select_all(action='DESELECT')
+        for island in islands:
+            island.select_set(True)
         context.view_layer.objects.active = obj
 
         return {'FINISHED'}

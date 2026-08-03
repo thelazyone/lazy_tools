@@ -2,6 +2,8 @@ import bpy
 from bpy.types import Panel, PropertyGroup
 from bpy.props import IntProperty, FloatProperty
 
+from . import mesh_operators
+
 class WeatheringProps(PropertyGroup):
     resolution_property: IntProperty(name="Resolution", default=64, min=16, max=4096)
     edge_relax_property: FloatProperty(name="Edge Relax", default=3.0, min=0, max=2048)
@@ -73,6 +75,10 @@ class WeatheringPanel(Panel):
 
         curr_column.separator()
         curr_column.operator("lazychip.op_fixmanifold")
+        if not mesh_operators.print3d_available():
+            warn = curr_column.column(align=True)
+            warn.label(text="Needs 3D Print Toolbox", icon='ERROR')
+            warn.label(text="Preferences > Get Extensions")
 
         # Selected Objects
         curr_column.separator()

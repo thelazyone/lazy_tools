@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Tests",
     "author": "thelazyone",
-    "version": (1, 0, 2),
+    "version": (1, 0, 3),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Testing new utilities in a dedicated panel",
@@ -10,36 +10,31 @@ bl_info = {
     "category": "Mesh",
 }
 
+import sys
+
 import bpy
 from bpy.types import Operator, Panel
 
 
+# The 3D Print Toolbox bridge lives in Lazy Chip, which owns it. This file used
+# to carry its own copy; the two drifted apart and this one ended up with an
+# inverted loop, so it now borrows the real implementation instead.
+def _lazy_chip_mesh_operators():
+    """Find lazy_chip.mesh_operators, whatever module path it is installed under."""
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not name.endswith("lazy_chip.mesh_operators"):
+            continue
+        if hasattr(mod, "make_manifold"):
+            return mod
+    return None
 
-def make_non_manifold(obj):
-    # Ensure the 3D Printing Toolbox is enabled
-    addon_key = 'mesh_3d_print_toolbox'
-    if addon_key not in bpy.context.preferences.addons:
-        bpy.ops.preferences.addon_enable(module=addon_key)
-    
-    # Save the current mode so we can return to it later
-    original_mode = obj.mode
-    
-    # Ensure object is in edit mode for the operation
-    if obj.mode != 'EDIT':
-        bpy.ops.object.mode_set(mode='EDIT')
-    
-    try:
-        # Perform the make non-manifold operation
-        bpy.ops.mesh.print3d_clean_non_manifold()
-    except AttributeError:
-        print("3D Printing Toolbox addon not installed!")
+
+def make_manifold(obj):
+    mod = _lazy_chip_mesh_operators()
+    if mod is None:
+        print("[Lazy Tests] Lazy Chip is not enabled - Make Manifold unavailable")
         return {'CANCELLED'}
-    finally:
-        # Return to the original mode
-        if original_mode != 'EDIT':
-            bpy.ops.object.mode_set(mode=original_mode)
-    
-    return {'FINISHED'}
+    return mod.make_manifold(obj)
 
 
 def is_watertight_mesh(obj):
@@ -72,31 +67,39 @@ def is_watertight_mesh(obj):
     return not has_non_manifold
 
 
-def make_non_manifold_iterate(obj, max_iterations):
+def make_manifold_iterate(obj, max_iterations):
     """Keep applying the fix until the mesh is watertight or we run out of tries."""
     for _ in range(max_iterations):
         if is_watertight_mesh(obj):
             break
-        make_non_manifold(obj)
+        if make_manifold(obj) == {'CANCELLED'}:
+            break
 
 
 
 class OBJECT_OT_test_make_manifold(Operator):
     bl_idname = "object.test_make_manifold"
     bl_label = "Test Make Manifold"
-    bl_description = "Using the 3D print toolbox make manifold."
+    bl_description = (
+        "Make the active mesh manifold. Needs Lazy Chip enabled and the "
+        "3D Print Toolbox extension installed"
+    )
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         return context.active_object is not None and context.active_object.type == 'MESH'
-    
 
     def execute(self, context):
-        obj = context.active_object
+        mod = _lazy_chip_mesh_operators()
+        if mod is None:
+            self.report({'ERROR'}, "Lazy Chip must be enabled - it owns the toolbox bridge")
+            return {'CANCELLED'}
+        if mod.get_manifold_operator() is None:
+            self.report({'ERROR'}, mod.MISSING_MESSAGE)
+            return {'CANCELLED'}
 
-        make_non_manifold_iterate(obj, 10)
-
+        make_manifold_iterate(context.active_object, 10)
         return {'FINISHED'}
 
 

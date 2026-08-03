@@ -4,7 +4,12 @@ from bpy.types import Operator
 
 # For profiling only:
 import time
-from .mesh_operators import make_non_manifold_iterate, is_watertight_mesh
+from .mesh_operators import (
+    MISSING_MESSAGE,
+    get_manifold_operator,
+    is_watertight_mesh,
+    make_manifold_iterate,
+)
 
 
 def clone_object(context, i_selected_object):
@@ -259,10 +264,14 @@ class LAZYCHIP_OP_applydamage(Operator):
             curr_object for curr_object in context.selected_objects if curr_object.type == 'MESH']
         self.apply_damage_one_pass(context, scene, all_meshes)
 
-        # If set, fixing all objects right after damage
+        # If set, fixing all objects right after damage. Needs the 3D Print
+        # Toolbox: warn once rather than failing silently per object.
         if scene.weathering_props.fix_between_steps_property:
-            for curr_object in all_meshes:
-                make_non_manifold_iterate(curr_object, 5)
+            if get_manifold_operator() is None:
+                self.report({'WARNING'}, f"Fix Between Steps skipped. {MISSING_MESSAGE}")
+            else:
+                for curr_object in all_meshes:
+                    make_manifold_iterate(curr_object, 5)
 
         # Checking for non watertight
         all_meshes = [
