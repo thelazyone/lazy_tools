@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Line Art",
     "author": "thelazyone",
-    "version": (0, 1, 38),
+    "version": (0, 1, 39),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "One-click NPR pipeline: collections, view layers with overrides, "
@@ -2325,7 +2325,11 @@ class LINEART_OT_render_composite(Operator):
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
         scene.render.use_compositing = True
-        bpy.ops.render.render('INVOKE_DEFAULT')
+        # Blocking EXEC, not INVOKE_DEFAULT: an async render job can execute the
+        # compositor before the freshly armed file name reaches the evaluated
+        # node tree, so every render would overwrite the same PNG. This is the
+        # same call the Render All Groups path uses, which stamps correctly.
+        bpy.ops.render.render(write_still=False)
         self.report({'INFO'}, f"File Output → {file_name}Image.png")
         return {'FINISHED'}
 
@@ -2385,7 +2389,9 @@ class LINEART_OT_render_split(Operator):
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
         scene.render.use_compositing = True
-        bpy.ops.render.render('INVOKE_DEFAULT')
+        # Blocking EXEC - see LINEART_OT_render_composite for why INVOKE_DEFAULT
+        # loses the timestamped file name.
+        bpy.ops.render.render(write_still=False)
         self.report({'INFO'}, f"File Output → {file_name}lines.png + flats")
         return {'FINISHED'}
 
