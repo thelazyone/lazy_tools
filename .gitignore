@@ -4,6 +4,10 @@
 # Python bytecode
 __pycache__/
 *.py[cod]
+Lazy Line Art/test_artifacts/
+Lazy Line Art/path_companion_rust/target/
+Lazy Line Art/Path Companion.exe
+Lazy Line Art/settings/
 
 # Editor / OS noise
 .vscode/
@@ -11,3 +15,5 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+Lazy Line Art/updates/

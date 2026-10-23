@@ -31,3 +31,10 @@ else works normally.
 
 Install each `.py` file (or the `lazy_chip` folder) as a Blender add-on. Point Lazy Reloader at
 this repo in its preferences to reload the others in place while editing.
+
+## Lazy Line Art and Path Companion
+
+The complete illustration workflow now lives in **[Lazy Line Art](Lazy%20Line%20Art/README.md)**:
+Blender add-on, native companion, launcher, saved defaults, legacy companion and tests.
+Open `Lazy Line Art/Path Companion.exe` or its launcher. Lazy Reloader also finds the
+add-on in this folder when its source directory is set to the Lazy Tools root.

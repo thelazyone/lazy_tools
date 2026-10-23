@@ -1,0 +1,4 @@
+numpy>=1.23
+Pillow>=9.1
+scipy>=1.9
+contourpy>=1.0

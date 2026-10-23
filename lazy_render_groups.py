@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Lazy Render Groups",
     "author": "thelazyone",
-    "version": (0, 1, 4),
+    "version": (0, 2, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Lazy Tools",
     "description": "Organize models into render groups (collections). Switch which "
@@ -253,6 +253,14 @@ class LazyRenderGroupsProps(PropertyGroup):
         default=False,
         description="When on, every render group is visible",
         update=_on_visibility_props_changed,
+    )
+    add_timestamp: BoolProperty(
+        name="Timestamp in File Name",
+        default=True,
+        description=(
+            "Append a date/time stamp to rendered file names. Turn off to get "
+            "stable names (re-rendering overwrites the previous file)"
+        ),
     )
 
 
@@ -512,12 +520,54 @@ def _pop_transparent_png_settings(scene, saved):
     image.color_mode = saved["color_mode"]
 
 
+def _render_groups(op, context, groups):
+    """Solo each group in turn, write a transparent PNG, restore visibility.
+
+    groups: sequence of (index, item) as yielded by iter_groups().
+    """
+    scene = context.scene
+    if not bpy.data.is_saved:
+        op.report({'ERROR'}, "Save the .blend first")
+        return {'CANCELLED'}
+
+    props = scene.lazy_render_groups_props
+    previous_index = props.active_index
+    previous_show_all = props.show_all
+    saved_output = _push_transparent_png_settings(scene)
+
+    blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
+    stamp = datetime.now().strftime("_%Y%m%d_%H%M%S") if props.add_timestamp else ""
+    rendered = 0
+
+    try:
+        for index, item in groups:
+            activate_group(scene, index)
+            context.view_layer.update()
+
+            safe = _safe_filename(item.name)
+            scene.render.filepath = os.path.join(blend_dir, f"{safe}{stamp}")
+            bpy.ops.render.render(write_still=True)
+            rendered += 1
+    finally:
+        _pop_transparent_png_settings(scene, saved_output)
+        props.show_all = previous_show_all
+        if previous_show_all:
+            _apply_visibility(scene)
+        elif 0 <= previous_index < len(props.groups):
+            activate_group(scene, previous_index)
+        else:
+            activate_group(scene, -1)
+
+    op.report({'INFO'}, f"Rendered {rendered} group(s) → {blend_dir}")
+    return {'FINISHED'}
+
+
 class LZRG_OT_render_all(Operator):
     bl_idname = "lazyrendergroups.render_all"
     bl_label = "Render All Groups"
     bl_description = (
         "Activate each group in turn and render a transparent PNG still next "
-        "to the .blend, named with the group name and a timestamp"
+        "to the .blend, named with the group name (and a timestamp, if enabled)"
     )
     bl_options = {'REGISTER'}
 
@@ -527,48 +577,43 @@ class LZRG_OT_render_all(Operator):
 
     def execute(self, context):
         scene = context.scene
-        if not bpy.data.is_saved:
-            self.report({'ERROR'}, "Save the .blend first")
-            return {'CANCELLED'}
-
         prune_missing_groups(scene)
         groups = list(iter_groups(scene))
         if not groups:
             self.report({'WARNING'}, "No render groups")
             return {'CANCELLED'}
+        return _render_groups(self, context, groups)
 
+
+class LZRG_OT_render_selected(Operator):
+    bl_idname = "lazyrendergroups.render_selected"
+    bl_label = "Render Selected Group"
+    bl_description = (
+        "Render only the group highlighted in the list, using the same naming "
+        "rules as Render All Groups"
+    )
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_render_groups(context.scene)
+
+    def execute(self, context):
+        scene = context.scene
+        prune_missing_groups(scene)
         props = scene.lazy_render_groups_props
-        previous_index = props.active_index
-        previous_show_all = props.show_all
-        saved_output = _push_transparent_png_settings(scene)
 
-        blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rendered = 0
+        index = props.active_index
+        if not (0 <= index < len(props.groups)):
+            self.report({'ERROR'}, "No group selected — click a group in the list")
+            return {'CANCELLED'}
 
-        try:
-            for index, item in groups:
-                activate_group(scene, index)
-                context.view_layer.update()
+        item = props.groups[index]
+        if item.collection is None:
+            self.report({'ERROR'}, f"Group '{item.name}' has no collection")
+            return {'CANCELLED'}
 
-                safe = _safe_filename(item.name)
-                scene.render.filepath = os.path.join(
-                    blend_dir, f"lazy_render_{safe}_{stamp}"
-                )
-                bpy.ops.render.render(write_still=True)
-                rendered += 1
-        finally:
-            _pop_transparent_png_settings(scene, saved_output)
-            props.show_all = previous_show_all
-            if previous_show_all:
-                _apply_visibility(scene)
-            elif 0 <= previous_index < len(props.groups):
-                activate_group(scene, previous_index)
-            else:
-                activate_group(scene, -1)
-
-        self.report({'INFO'}, f"Rendered {rendered} group(s) → {blend_dir}")
-        return {'FINISHED'}
+        return _render_groups(self, context, [(index, item)])
 
 
 # ----------------------------------------------------------------------------
@@ -682,8 +727,12 @@ class LZRG_PT_panel(Panel):
                 )
 
         layout.separator()
+        layout.prop(props, "add_timestamp")
         col = layout.column()
         col.scale_y = 1.4
+        sel = col.column()
+        sel.enabled = 0 <= props.active_index < len(props.groups)
+        sel.operator(LZRG_OT_render_selected.bl_idname, icon='RENDER_STILL')
         col.operator(LZRG_OT_render_all.bl_idname, icon='RENDER_ANIMATION')
         layout.label(text="Camera/lights stay outside groups.")
 
@@ -703,6 +752,7 @@ classes = (
     LZRG_OT_show_all,
     LZRG_OT_hide_all,
     LZRG_OT_render_all,
+    LZRG_OT_render_selected,
     LZRG_PT_panel,
 )
 

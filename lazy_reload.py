@@ -178,6 +178,12 @@ def _source_addon_path(module_name):
     if os.path.isdir(package_dir) and os.path.isfile(os.path.join(package_dir, "__init__.py")):
         return package_dir, True
 
+    # The illustration workflow lives together in its own tool folder.
+    if short == "lazy_lineart":
+        grouped_file = os.path.join(root, "Lazy Line Art", "lazy_lineart.py")
+        if os.path.isfile(grouped_file):
+            return grouped_file, False
+
     py_file = os.path.join(root, f"{short}.py")
     if os.path.isfile(py_file):
         return py_file, False
